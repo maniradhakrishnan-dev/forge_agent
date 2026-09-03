@@ -1,0 +1,56 @@
+"""
+Integration Test for Basic P0 Single-Part Verification Loop (Async).
+Runs the generate -> kernel -> critic -> export flow asynchronously using python-OCP & CadQuery.
+"""
+
+import asyncio
+from pathlib import Path
+from orchestrator.basic_loop import run_basic_p0_loop
+from tools.cad_kernel import execute_cadquery_code
+from tools.verify_single_part import verify_single_part
+
+
+def test_cadquery_execution():
+    """Test CadQuery kernel execution sandbox asynchronously."""
+    code = """import cadquery as cq
+result = cq.Workplane("XY").box(10, 10, 10)
+"""
+    solid, err = asyncio.run(execute_cadquery_code(code))
+    assert err is None, f"CadQuery execution failed: {err}"
+    assert solid is not None
+    assert solid.val().isValid() is True
+
+
+def test_single_part_verification():
+    """Test single part DFM and topology verification checks."""
+    import cadquery as cq
+    box = cq.Workplane("XY").box(40, 30, 10).faces(">Z").workplane().hole(4.3)
+    verdict = verify_single_part(box, min_wall=1.5, min_hole=2.0)
+    assert verdict.passed is True, f"Verification failed: {verdict.diagnostics}"
+    assert verdict.bounding_box["xlen"] == 40.0
+    assert verdict.bounding_box["ylen"] == 30.0
+    assert verdict.bounding_box["zlen"] == 10.0
+
+
+def test_basic_p0_loop_end_to_end(tmp_path):
+    """Test end-to-end basic P0 loop asynchronously with artifact export."""
+    prompt = "Single mounting bracket 40x30x10mm with a central 4.3mm M4 clearance hole"
+    out_dir = str(tmp_path / "artifacts")
+    
+    success, verdict, code, artifact_paths = asyncio.run(
+        run_basic_p0_loop(prompt, output_dir=out_dir)
+    )
+    
+    assert success is True, f"P0 Loop failed. Verdict: {verdict}"
+    assert "step" in artifact_paths and Path(artifact_paths["step"]).exists()
+    assert "stl" in artifact_paths and Path(artifact_paths["stl"]).exists()
+    assert "result =" in code
+    print("\n[SUCCESS] Async Basic P0 Loop passed end-to-end!")
+    print(f"Exported STEP: {artifact_paths['step']}")
+    print(f"Exported STL: {artifact_paths['stl']}")
+
+
+if __name__ == "__main__":
+    test_cadquery_execution()
+    test_single_part_verification()
+    test_basic_p0_loop_end_to_end(Path("artifacts/test_output"))

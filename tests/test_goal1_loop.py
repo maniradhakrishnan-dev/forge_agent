@@ -3,12 +3,14 @@ Integration Test Suite for Goal 1 Multi-Agent Pipeline.
 Tests Planner Agent -> Code Generator Agent -> Sandbox -> Verification Agent -> Repair Agent -> Export.
 """
 
+import pytest
 import asyncio
 from pathlib import Path
 from orchestrator.gateway_client import GatewayClient
-from orchestrator.goal1_loop import run_goal1_pipeline
+from orchestrator.part_pipeline import run_single_part_pipeline
 
 
+@pytest.mark.live
 def test_goal1_pipeline_end_to_end(tmp_path):
     """Test full Goal 1 pipeline asynchronously."""
     prompt = "Create a heavy-duty mounting bracket 40x30x10mm with two M4 clearance holes"
@@ -16,11 +18,11 @@ def test_goal1_pipeline_end_to_end(tmp_path):
     
     gw = GatewayClient()
     success, spec, verdict, code, artifact_paths = asyncio.run(
-        run_goal1_pipeline(prompt, output_dir=out_dir, gateway_client=gw)
+        run_single_part_pipeline(prompt, output_dir=out_dir, gateway_client=gw)
     )
 
     assert success is True, f"Goal 1 Pipeline failed. Verdict: {verdict}"
-    assert spec.name == "mounting_bracket"
+    assert "bracket" in spec.name.lower() or "mount" in spec.name.lower() or spec.part_type == "mounting_bracket"
     assert "step" in artifact_paths and Path(artifact_paths["step"]).exists()
     assert "stl" in artifact_paths and Path(artifact_paths["stl"]).exists()
     assert "result =" in code

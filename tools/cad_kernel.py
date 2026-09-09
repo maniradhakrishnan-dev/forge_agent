@@ -3,8 +3,6 @@ CadQuery Kernel Execution Sandbox.
 Safely executes agent-authored CadQuery code asynchronously and exports STEP/STL files.
 """
 
-import sys
-import io
 import asyncio
 import traceback
 from typing import Dict, Any, Optional, Tuple

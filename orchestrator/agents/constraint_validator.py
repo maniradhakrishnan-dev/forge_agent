@@ -160,5 +160,58 @@ class ConstraintValidator:
                 else:
                     errors.append(f"Joint '{joint.id}' references invalid part_b '{joint.part_b}'.")
 
+        # 4. Validate Gear / Mesh Center Distance Consistency
+        for part in graph.parts:
+            for mate in part.mates:
+                if mate.mate_type == "gear_mesh":
+                    partner = next((p for p in graph.parts if p.id == mate.partner_id), None)
+                    if not partner:
+                        continue
+                    kp_a = part.kinematic_params or {}
+                    kp_b = partner.kinematic_params or {}
+                    d_a = float(kp_a.get("pitch_diameter") or (kp_a.get("module", 0) * kp_a.get("num_teeth", 0)))
+                    d_b = float(kp_b.get("pitch_diameter") or (kp_b.get("module", 0) * kp_b.get("num_teeth", 0)))
+
+                    if d_a > 0 and d_b > 0:
+                        is_internal = (
+                            kp_a.get("is_internal") or kp_b.get("is_internal") or
+                            "internal" in mate.my_feature_name.lower() or "ring" in part.id.lower() or "ring" in partner.id.lower()
+                        )
+                        c_expected = abs(d_a - d_b) / 2.0 if is_internal else (d_a + d_b) / 2.0
+
+                        # Check against shared_parameters or kinematic_params center distance
+                        shared_p = graph.shared_parameters or graph.master_skeleton or {}
+                        c_decl = (
+                            shared_p.get("center_to_center_distance") or
+                            shared_p.get("center_distance") or
+                            kp_a.get("center_distance") or
+                            kp_b.get("center_distance")
+                        )
+                        if c_decl is not None and abs(float(c_decl) - c_expected) > 0.2:
+                            # Auto-heal center distance in shared parameters to match physical tooth kinematics
+                            if "center_to_center_distance" in shared_p:
+                                shared_p["center_to_center_distance"] = round(c_expected, 3)
+                            elif "center_distance" in shared_p:
+                                shared_p["center_distance"] = round(c_expected, 3)
+                            else:
+                                shared_p["center_to_center_distance"] = round(c_expected, 3)
+
+        # 5. Check Graph Connectivity: ensure no completely disconnected orphan parts
+        connected_parts = set()
+        for p in graph.parts:
+            if p.mates:
+                connected_parts.add(p.id)
+                for m in p.mates:
+                    connected_parts.add(m.partner_id)
+        for j in graph.joints:
+            connected_parts.add(j.part_a)
+            connected_parts.add(j.part_b)
+
+        if len(graph.parts) > 1:
+            for p in graph.parts:
+                if p.id not in connected_parts:
+                    errors.append(f"Orphan part '{p.id}' has no mates or joints connecting it to the assembly graph.")
+
         is_valid = len(errors) == 0
         return ValidationResult(valid=is_valid, errors=errors)
+

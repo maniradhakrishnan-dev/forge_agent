@@ -10,9 +10,11 @@ from orchestrator.agents.assembly_agent import AssemblyAgent
 from orchestrator.agents.assembly_verifier_agent import AssemblyVerifierAgent
 from orchestrator.agents.assembly_repair_agent import AssemblyRepairAgent
 from orchestrator.agents.reporter_agent import ReporterAgent
+from orchestrator.agents.constraint_validator import ConstraintValidator
 
 __all__ = [
     "PlannerAgent",
+    "ConstraintValidator",
     "CodeGeneratorAgent",
     "PartVerifierAgent",
     "PartRepairAgent",

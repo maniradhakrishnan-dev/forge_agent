@@ -34,14 +34,16 @@ class GatewayConfig(BaseModel):
     gemini_api_key: Optional[str] = Field(default_factory=lambda: os.getenv("GEMINI_API_KEY"))
     groq_api_key: Optional[str] = Field(default_factory=lambda: os.getenv("GROQ_API_KEY"))
 
-    gemini_model: str = Field(default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite"))
-    groq_model: str = Field(default_factory=lambda: os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"))
+    gemini_model: str = Field(default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-3.7-flash"))
+    groq_model: str = Field(default_factory=lambda: os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"))
 
     timeout: float = 60.0
 
 
 class GatewayClient:
     def __init__(self, config: Optional[GatewayConfig] = None):
+        # Reload .env dynamically so user changes in .env are reflected immediately
+        load_dotenv(override=True)
         self.config = config or GatewayConfig()
 
     async def complete(
@@ -49,7 +51,7 @@ class GatewayClient:
         messages: List[Dict[str, str]],
         provider: Optional[str] = None,
         temperature: float = 0.2,
-        max_tokens: int = 4000
+        max_tokens: int = 8192
     ) -> str:
         """
         Routes chat completions: Gemini -> Groq -> HARD FAIL.
@@ -120,7 +122,8 @@ class GatewayClient:
             "contents": contents,
             "generationConfig": {
                 "temperature": temperature,
-                "maxOutputTokens": max_tokens
+                "maxOutputTokens": max_tokens,
+                "thinkingConfig": {"thinkingBudget": 0}
             }
         }
         if system_instruction:
@@ -131,9 +134,26 @@ class GatewayClient:
             resp = None
             for attempt in range(1, max_retries + 1):
                 resp = await client.post(url, json=payload)
+                # If model does not support thinkingConfig (returns HTTP 400), retry without it
+                if resp.status_code == 400 and "thinkingConfig" in payload.get("generationConfig", {}):
+                    del payload["generationConfig"]["thinkingConfig"]
+                    resp = await client.post(url, json=payload)
+
                 if resp.status_code in (429, 500, 503) and attempt < max_retries:
-                    import asyncio
-                    await asyncio.sleep(attempt * 1.5)
+                    backoff = attempt * 3.0
+                    if resp.status_code == 429:
+                        try:
+                            err_data = resp.json().get("error", {})
+                            for item in err_data.get("details", []):
+                                if "retryDelay" in item:
+                                    backoff = float(str(item["retryDelay"]).rstrip("s")) + 1.0
+                                    break
+                        except Exception:
+                            backoff = 10.0 * attempt
+                    # If backoff is excessively long (>15s) and Groq fallback is configured, break to fallback immediately
+                    if backoff > 15.0 and self.config.groq_api_key:
+                        break
+                    await asyncio.sleep(backoff)
                     continue
                 break
 
@@ -160,14 +180,15 @@ class GatewayClient:
                 )
 
             parts = candidates[0].get("content", {}).get("parts", [])
-            if not parts:
+            text_parts = [p.get("text", "") for p in parts if "text" in p]
+            if not text_parts or not any(text_parts):
                 raise LLMAPIError(
                     provider=f"Gemini ({model})",
                     status_code=200,
-                    detail="No content parts in response candidate."
+                    detail="No text parts in response candidate."
                 )
 
-            return parts[0].get("text", "")
+            return "".join(text_parts)
 
     async def _call_groq(
         self, messages: List[Dict[str, str]], temperature: float, max_tokens: int

@@ -3,7 +3,7 @@ Agent Guardrail Toolbox Enforcement for ForgeAgent.
 Isolates tools and skills per agent role to prevent tool leakage or unauthorized execution.
 """
 
-from typing import List, Dict, Set
+from typing import Dict, Set
 
 
 class AgentToolboxError(PermissionError):
@@ -16,12 +16,12 @@ class AgentToolbox:
 
     ALLOWED_TOOLS: Dict[str, Set[str]] = {
         "planner_agent": {"gateway_client"},
-        "code_generator_agent": {"gateway_client", "skills_cadquery", "skills_assembly"},
+        "code_generator_agent": {"gateway_client", "skills_cadquery", "skills_assembly", "code_editor"},
         "part_verifier_agent": {"verify_single_part"},  # Read-only OpenCascade math
-        "part_repair_agent": set(),                      # Pure template formatter
-        "assembly_agent": {"gateway_client", "cad_kernel_assembly", "skills_assembly"},
+        "part_repair_agent": {"code_reader", "code_editor", "cad_kernel_sandbox", "verify_single_part"},
+        "assembly_agent": {"cad_kernel_assembly"},
         "assembly_verifier_agent": {"verify_assembly"},  # Read-only OpenCascade assembly math
-        "assembly_repair_agent": {"gateway_client"},
+        "assembly_repair_agent": {"graph_editor", "code_editor"},
         "reporter_agent": {"cad_kernel_export", "run_logger"},
     }
 

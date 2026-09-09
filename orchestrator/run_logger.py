@@ -4,21 +4,27 @@ Appends typed RunEntry records to a JSONL log file per execution run,
 prints real-time transparent progress to the terminal, and generates run_summary.md.
 """
 
-import json
-import time
+import asyncio
 from pathlib import Path
 from typing import List, Any, Optional
 from orchestrator.models import RunEntry
 
 
 class RunLogger:
-    def __init__(self, run_id: str, output_dir: str = "artifacts/run_logs", verbose: bool = True):
+    def __init__(
+        self,
+        run_id: str,
+        output_dir: str = "artifacts/run_logs",
+        verbose: bool = True,
+        on_step_callback: Optional[Any] = None
+    ):
         self.run_id = run_id
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.log_file = self.output_dir / "run_log.jsonl"
         self.summary_file = self.output_dir / "run_summary.md"
         self.verbose = verbose
+        self.on_step_callback = on_step_callback
         self.entries: List[RunEntry] = []
 
     def log_step(
@@ -57,6 +63,19 @@ class RunLogger:
         # 2. Real-time Terminal Logging
         if self.verbose:
             self._print_terminal_step(entry)
+
+        # 3. Live Graph Hook Callback
+        if self.on_step_callback:
+            try:
+                res = self.on_step_callback(entry)
+                if asyncio.iscoroutine(res):
+                    try:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(res)
+                    except RuntimeError:
+                        asyncio.run(res)
+            except Exception:
+                pass
 
         return entry
 

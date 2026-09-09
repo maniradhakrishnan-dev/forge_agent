@@ -4,7 +4,7 @@ Executes ground-truth OpenCascade math checks for interference, fit clearance, a
 """
 
 from typing import Dict, Any, List, Optional
-from orchestrator.models import AssemblyVerdict, JointDef
+from orchestrator.models import AssemblyVerdict
 from tools.verify_assembly import verify_assembly
 
 
@@ -18,7 +18,9 @@ class AssemblyVerifierAgent:
     def verify_assembly_solids(
         self,
         parts: Dict[str, Any],
-        joints: Optional[List[JointDef]] = None
+        joints: Optional[List[Any]] = None,
+        graph: Optional[Any] = None,
+        interfaces: Optional[Dict[str, Dict[str, Any]]] = None
     ) -> AssemblyVerdict:
         """
         Runs multi-part OpenCascade math checks and returns an AssemblyVerdict.
@@ -26,6 +28,8 @@ class AssemblyVerifierAgent:
         return verify_assembly(
             parts,
             joints=joints,
+            graph=graph,
+            interfaces=interfaces,
             min_clearance=self.min_clearance,
             max_clearance=self.max_clearance
         )

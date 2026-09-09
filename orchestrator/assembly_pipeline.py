@@ -13,25 +13,22 @@ Complete End-to-End Multi-Agent Assembly Pipeline:
 import time
 import uuid
 import asyncio
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, Tuple, Optional
 from orchestrator.gateway_client import GatewayClient
 from orchestrator.models import (
     AssemblyGraph,
-    PartSpec,
     DesignerOutput,
-    VerificationVerdict,
     AssemblyVerdict,
-    ValidationResult,
-    RepairInstruction
 )
 from orchestrator.run_logger import RunLogger
 from orchestrator.agents.planner_agent import PlannerAgent
 from orchestrator.agents.assembly_agent import AssemblyAgent
 from orchestrator.agents.assembly_verifier_agent import AssemblyVerifierAgent
 from orchestrator.agents.assembly_repair_agent import AssemblyRepairAgent
-from orchestrator.constraint_validator import ConstraintValidator
+from orchestrator.agents.constraint_validator import ConstraintValidator
+from orchestrator.live_graph.planner import LiveCADPlanner
 from orchestrator.part_pipeline import run_part_pipeline
-from tools.cad_kernel import export_cad_artifacts
+from tools.cad_kernel import export_cad_artifacts, execute_cadquery_code
 
 
 async def run_full_assembly_pipeline(
@@ -40,22 +37,23 @@ async def run_full_assembly_pipeline(
     max_part_retries: int = 3,
     max_assembly_retries: int = 3,
     gateway_client: Optional[GatewayClient] = None,
-    run_id: Optional[str] = None
+    run_id: Optional[str] = None,
+    run_logger: Optional[RunLogger] = None
 ) -> Tuple[bool, AssemblyGraph, AssemblyVerdict, Dict[str, Any], Dict[str, Dict[str, str]]]:
     """
-    Executes full multi-part assembly design, verification, and diagnostic repair pipeline.
+    Complete end-to-end multi-agent assembly pipeline driven by dynamic mechanism classification:
+    Prompt -> PlannerAgent -> ConstraintValidator -> Dynamic Execution Plan (Waves) -> AssemblyAgent -> AssemblyVerifierAgent -> Export
     """
-    run_id = run_id or str(uuid.uuid4())[:8]
-    logger = RunLogger(run_id=run_id, output_dir=output_dir)
     gw = gateway_client or GatewayClient()
+    logger = run_logger or RunLogger(run_id=run_id or str(uuid.uuid4())[:8], output_dir=output_dir)
 
     planner = PlannerAgent(gw)
     assembler = AssemblyAgent(gw)
     verifier = AssemblyVerifierAgent()
     repair_router = AssemblyRepairAgent(gw)
 
-    # 1. Planner Agent decomposes prompt -> AssemblyGraph with ConstraintValidator retry loop
-    print(f"\n[Phase 1/4] 🧠 Decomposing prompt into AssemblyGraph...")
+    # 1. Planner Agent decomposes user prompt into AssemblyGraph
+    print(f"\n[Phase 1/4] 🧠 Decomposing prompt into AssemblyGraph via PlannerAgent...")
     max_planning_retries = 3
     graph = None
     validation_errors = None
@@ -86,38 +84,79 @@ async def run_full_assembly_pipeline(
                 return False, graph, AssemblyVerdict(passed=False), {}, {}
             print(f"  🔧 Feeding validation errors back to PlannerAgent for self-correction...")
 
-    # 3. Parallel Part Generation for all parts in AssemblyGraph
-    print(f"\n[Phase 2/4] ⚙️  Designing & verifying {len(graph.parts)} parts concurrently {[p.name for p in graph.parts]}...")
-    shared_params = graph.shared_parameters or graph.master_skeleton
-    part_tasks = [
-        run_part_pipeline(
-            spec=part_spec,
-            output_dir=output_dir,
-            max_retries=max_part_retries,
-            gateway_client=gw,
-            run_logger=logger,
-            master_skeleton=shared_params
-        )
-        for part_spec in graph.parts
-    ]
+    # 3. Dynamic Live Graph Execution: Reactive Topological Dispatch
+    live_planner = LiveCADPlanner(graph)
+    print(f"\n[Phase 2/4] 🚀 Reactive Live Graph: Designing {len(graph.parts)} parts dynamically from physical interface events...")
 
-    results = await asyncio.gather(*part_tasks)
-
+    part_map = {p.id: p for p in graph.parts}
     designer_outputs: Dict[str, DesignerOutput] = {}
     verified_solids: Dict[str, Any] = {}
     interfaces: Dict[str, Dict[str, Any]] = {}
     part_artifacts: Dict[str, Dict[str, str]] = {}
 
-    for part_spec, (passed, designer_out, verdict, solid_obj, artifacts) in zip(graph.parts, results):
-        if passed and designer_out:
-            designer_outputs[part_spec.id] = designer_out
-            verified_solids[part_spec.id] = solid_obj
-            interfaces[part_spec.id] = designer_out.interfaces
-            part_artifacts[part_spec.id] = artifacts
-        else:
-            logger.log_step(agent="assembly_pipeline", status="FAIL", diagnostics=[f"Part '{part_spec.id}' failed single-part DFM."])
-            logger.generate_summary_markdown(prompt, False)
-            return False, graph, AssemblyVerdict(passed=False), {}, {}
+    remaining_parts = set(part_map.keys())
+    running_tasks: Dict[asyncio.Task, str] = {}
+    sem = asyncio.Semaphore(2)
+
+    async def _execute_part(ps, dp):
+        async with sem:
+            shared_params = graph.shared_parameters if graph.shared_parameters is not None else graph.master_skeleton
+            return await run_part_pipeline(
+                spec=ps,
+                output_dir=output_dir,
+                max_retries=max_part_retries,
+                gateway_client=gw,
+                run_logger=logger,
+                master_skeleton=shared_params,
+                partner_interfaces=dp if dp else None,
+            )
+
+    while remaining_parts or running_tasks:
+        # Identify ready parts whose prerequisite interface dependencies are proven
+        ready_parts = [
+            pid for pid in list(remaining_parts)
+            if live_planner.deps.get(pid, set()).issubset(interfaces.keys())
+        ]
+
+        for pid in ready_parts:
+            remaining_parts.remove(pid)
+            part_spec = part_map[pid]
+            dep_ports = {
+                dep_id: interfaces[dep_id]
+                for dep_id in live_planner.deps.get(pid, set())
+                if dep_id in interfaces
+            }
+
+            t = asyncio.create_task(_execute_part(part_spec, dep_ports))
+            running_tasks[t] = pid
+            print(f"  ⚡ [LiveGraph] Dispatched part '{pid}' (Prerequisites: {list(dep_ports.keys()) or 'None (Root Datum)'})")
+
+        if not running_tasks:
+            if remaining_parts:
+                next_pid = remaining_parts.pop()
+                print(f"  ⚠️ [LiveGraph] Breaking dependency cycle on '{next_pid}'")
+                part_spec = part_map[next_pid]
+                dep_ports = {dep_id: interfaces[dep_id] for dep_id in interfaces}
+                t = asyncio.create_task(_execute_part(part_spec, dep_ports))
+                running_tasks[t] = next_pid
+            else:
+                break
+
+        done, _ = await asyncio.wait(running_tasks.keys(), return_when=asyncio.FIRST_COMPLETED)
+        for completed_task in done:
+            pid = running_tasks.pop(completed_task)
+            res = completed_task.result()
+            passed, designer_out, verdict, solid_obj, artifacts = res[0], res[1], res[2], res[3], res[4]
+            if passed and designer_out:
+                designer_outputs[pid] = designer_out
+                verified_solids[pid] = solid_obj
+                interfaces[pid] = designer_out.interfaces
+                part_artifacts[pid] = artifacts
+                print(f"  ✅ [LiveGraph] Part '{pid}' passed physical verification; recorded interface ports: {list(designer_out.interfaces.keys())}")
+            else:
+                logger.log_step(agent="assembly_pipeline", status="FAIL", diagnostics=[f"Part '{pid}' failed single-part DFM in live graph."])
+                logger.generate_summary_markdown(prompt, False)
+                return False, graph, AssemblyVerdict(passed=False), {}, {}
 
     # 4. Multi-Part Assembly & Verification Loop
     print(f"\n[Phase 3/4] 🧩 Mating parts and verifying 3D spatial alignment...")
@@ -136,7 +175,12 @@ async def run_full_assembly_pipeline(
 
         # Run Assembly Verifier checks (Interference, Fit Clearance, Kinematics)
         t_ver = time.time()
-        final_verdict = verifier.verify_assembly_solids(transformed_solids, joints=graph.joints)
+        final_verdict = verifier.verify_assembly_solids(
+            transformed_solids,
+            joints=graph.joints,
+            graph=graph,
+            interfaces=interfaces
+        )
         ver_status = "PASS" if final_verdict.passed else "FAIL"
         logger.log_step(
             agent="assembly_verifier_agent",
@@ -147,33 +191,55 @@ async def run_full_assembly_pipeline(
         )
 
         if final_verdict.passed:
-            # 5. Export assembled STEP/STL artifacts on success
+            # 5. Export assembled STEP/STL and Python assembly script artifacts on success
             print(f"\n[Phase 4/4] 💾 Exporting multi-part assembly CAD artifacts...")
             if cq_assembly:
-                assy_artifacts = await export_cad_artifacts(cq_assembly, output_dir, graph.name)
+                assy_code = assembler.generate_assembly_script(graph, output_dir)
+                assy_artifacts = await export_cad_artifacts(cq_assembly, output_dir, graph.name, code=assy_code)
                 part_artifacts["assembly"] = assy_artifacts
             logger.log_step(agent="reporter_agent", iteration=assy_iter, status="PASS")
             logger.generate_summary_markdown(prompt, True)
             return True, graph, final_verdict, transformed_solids, part_artifacts
 
         else:
-            # 6. Assembly Repair Diagnostic Router
-            instruction = repair_router.diagnose_repair(final_verdict, graph, retry_count=assy_iter)
+            # 6. Assembly Repair Diagnostic Router (3-way triage: graph_patch, tolerance_patch, geometry)
+            part_codes_map = {pid: d.code for pid, d in designer_outputs.items()}
+            instruction = repair_router.diagnose_repair(
+                final_verdict, graph, retry_count=assy_iter, part_codes=part_codes_map
+            )
             logger.log_step(agent="assembly_repair_agent", iteration=assy_iter, status="FAIL", diagnostics=[instruction.model_dump()])
 
-            if instruction.fault_type == "positioning":
+            if instruction.fault_type == "graph_patch":
+                print(f"  🔧 [AssemblyRepair] Direct graph patch applied (zero LLM): {instruction.prompt}")
+                if instruction.patched_graph:
+                    graph = instruction.patched_graph
+            elif instruction.fault_type == "tolerance_patch":
+                print(f"  🔧 [AssemblyRepair] Direct tolerance patch applied (zero LLM): {instruction.prompt}")
+                if instruction.patched_graph:
+                    graph = instruction.patched_graph
+                if instruction.patched_code:
+                    for pid, fixed_code in instruction.patched_code.items():
+                        solid, err = await execute_cadquery_code(fixed_code)
+                        if not err and solid:
+                            verified_solids[pid] = solid
+                            if pid in designer_outputs:
+                                designer_outputs[pid].code = fixed_code
+            elif instruction.fault_type == "positioning":
                 pos_repair_prompt = instruction.prompt
             elif instruction.fault_type == "geometry" and instruction.target_part_id in designer_outputs:
-                # Target re-generation of specific faulty part
+                # Target re-generation of specific faulty part (parametric fix attempted first in part_pipeline)
                 target_spec = next((p for p in graph.parts if p.id == instruction.target_part_id), None)
                 if target_spec:
+                    prev_c = designer_outputs[target_spec.id].code if target_spec.id in designer_outputs else None
                     p_passed, p_out, p_ver, p_solid, p_art = await run_part_pipeline(
                         spec=target_spec,
                         output_dir=output_dir,
                         max_retries=2,
                         gateway_client=gw,
                         run_logger=logger,
-                        master_skeleton=shared_params
+                        master_skeleton=graph.shared_parameters if graph.shared_parameters is not None else graph.master_skeleton,
+                        initial_code=prev_c,
+                        user_modification_prompt=instruction.prompt
                     )
                     if p_passed and p_out:
                         designer_outputs[target_spec.id] = p_out

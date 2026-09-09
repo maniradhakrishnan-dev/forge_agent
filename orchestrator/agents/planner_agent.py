@@ -6,7 +6,7 @@ using LLM inference. NO hardcoded fallbacks — the LLM does all the thinking.
 
 import json
 from typing import Optional, List, Dict, Any
-from orchestrator.gateway_client import GatewayClient, LLMAPIError
+from orchestrator.gateway_client import GatewayClient
 from orchestrator.models import AssemblyGraph, PartSpec
 from orchestrator.toolbox import AgentToolbox
 
@@ -52,10 +52,11 @@ Your job: Decompose the user's plain-English mechanical design prompt into a str
       "height": 40.0,
       "hole_diameter": 5.3,
       "wall_thickness": 2.0,
+      "is_compliant": false,
       "mates": [
         {
           "partner_id": "part_2",
-          "mate_type": "hole_shaft | shaft_hole | face_face | edge_edge",
+          "mate_type": "hole_shaft | shaft_hole | face_face | edge_edge | gear_mesh",
           "my_feature_name": "feature_name",
           "my_feature_diameter": 5.3,
           "clearance_mm": 0.15
@@ -78,7 +79,11 @@ Your job: Decompose the user's plain-English mechanical design prompt into a str
 1. First-Principles Engineering Reasoning:
    - Reason through the mechanical physics, motion, and dimensions dynamically for whatever mechanism is requested.
    - Do NOT assume a specific mechanism type. Calculate ratios, center distances, and envelopes directly from the user's prompt requirements.
-   - Mechanism Completeness: Include all essential functional components needed to transmit power and complete the kinematic loop. For example, for a planetary/epicyclic gearbox, include the sun gear, planet gear (specify `num_planets: 3` in `shared_parameters`), ring gear casing, and the planet carrier plate (with pins to support the planets and an output shaft).
+   - Mechanism Completeness: Include all essential functional components needed to transmit power and complete the kinematic loop:
+     * Planetary Gearbox: Sun gear, planet gears (specify `num_planets: 3` in `shared_parameters`), ring gear casing, and planet carrier plate.
+     * Harmonic Drive (Strain Wave): Wave generator (elliptical cam), flexspline (thin-walled flexible cup with external teeth, marked `"is_compliant": true`), and circular spline (rigid internal ring).
+     * Cycloidal Drive: Eccentric input shaft/bearing, cycloidal disc (epitrochoid lobes), ring pin housing, and output pin carrier.
+     * Compliant Mechanisms (snap fits, living hinges, bistable clips): Mark `"is_compliant": true` on flexible components.
 2. Shared Parameters (Top-Down Consistency):
    - Populate `shared_parameters` with any global design constants that multiple parts must agree on (e.g. center distances, matching shaft/bore sizes, pitch, wall thicknesses).
    - Ensure mating features between parts share identical or clearance-offset dimensions.
@@ -175,3 +180,88 @@ class PlannerAgent:
         """
         graph = await self.plan_assembly(prompt)
         return graph.parts[0]
+
+    async def plan_iteration_part(self, existing_code: str, user_feedback: str) -> PartSpec:
+        """
+        Analyzes existing CadQuery code and user modification feedback to generate an updated PartSpec.
+        """
+        AgentToolbox.enforce("planner_agent", "gateway_client")
+        system_prompt = (
+            "You are the Architect Planner Agent for ForgeAgent. "
+            "Your job is to formulate a focused, minimal PartSpec update for an existing mechanical part based strictly on the user's iteration request.\n\n"
+            "## CRITICAL ITERATION RULES:\n"
+            "1. STRICT MINIMALITY: Only specify changes and features that the user explicitly asked for.\n"
+            "2. DO NOT invent or assume unsolicited features (e.g., extra mounting holes, fastener patterns, counterbores, fillets) unless the user explicitly requested them.\n"
+            "3. PRESERVE BASE GEOMETRY: Keep existing dimensions, part names, and base features intact unless the user explicitly instructs to alter them.\n"
+            "4. Respond ONLY with valid raw JSON representing the updated PartSpec (matching schema: name, description, length, width, height, hole_diameter, wall_thickness, etc.). Do not include markdown code fences."
+        )
+        prompt = (
+            f"Existing CadQuery Code:\n```python\n{existing_code[:2500]}\n```\n\n"
+            f"User Modification Request:\n{user_feedback}\n\n"
+            f"Output the updated PartSpec JSON reflecting ONLY the exact user requested modifications. "
+            f"Respond ONLY with raw JSON."
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt}
+        ]
+        response_text = await self.gateway.complete(messages, temperature=0.1)
+        cleaned = response_text.strip()
+        if cleaned.startswith("```"):
+            first_nl = cleaned.index("\n")
+            cleaned = cleaned[first_nl + 1:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
+
+        data = json.loads(cleaned)
+        if "parts" in data and isinstance(data["parts"], list) and data["parts"]:
+            return PartSpec(**data["parts"][0])
+        return PartSpec(**data)
+
+    async def plan_iteration_assembly(
+        self,
+        existing_graph: AssemblyGraph,
+        user_feedback: str,
+        part_codes: Dict[str, str]
+    ) -> Dict[str, Any]:
+        """
+        Analyzes user modification feedback on an existing assembly and determines which parts must be updated.
+        """
+        AgentToolbox.enforce("planner_agent", "gateway_client")
+        parts_info = [
+            {"id": p.id, "name": p.name, "description": p.description, "process": p.manufacturing_process}
+            for p in existing_graph.parts
+        ]
+        shared_info = existing_graph.shared_parameters or {}
+        prompt = (
+            f"You are the Architect Planner Agent. The user wants to iterate on an existing mechanical assembly.\n\n"
+            f"Existing Assembly Name: {existing_graph.name}\n"
+            f"Existing Mechanism Type: {existing_graph.mechanism_type}\n"
+            f"Existing Shared Parameters: {json.dumps(shared_info)}\n"
+            f"Existing Parts:\n{json.dumps(parts_info, indent=2)}\n\n"
+            f"User Modification Request:\n{user_feedback}\n\n"
+            f"Determine which part(s) need changes and what specific instructions to give each part designer. "
+            f"If shared dimensions (center distances, matching hole/shaft sizes, wall thickness) must change, include them in 'updated_shared_parameters'. "
+            f"Respond ONLY with raw JSON matching this schema:\n"
+            f"{{\n"
+            f'  "affected_parts": ["part_id_1"],\n'
+            f'  "part_instructions": {{"part_id_1": "specific instructions for modifying part_1"}},\n'
+            f'  "updated_shared_parameters": {{"param_name": 12.0}},\n'
+            f'  "summary": "brief summary of changes"\n'
+            f"}}"
+        )
+        messages = [
+            {"role": "system", "content": "You are the Architect Planner Agent for ForgeAgent. Respond ONLY with valid JSON, no markdown fences."},
+            {"role": "user", "content": prompt}
+        ]
+        response_text = await self.gateway.complete(messages, temperature=0.1)
+        cleaned = response_text.strip()
+        if cleaned.startswith("```"):
+            first_nl = cleaned.index("\n")
+            cleaned = cleaned[first_nl + 1:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
+
+        return json.loads(cleaned)

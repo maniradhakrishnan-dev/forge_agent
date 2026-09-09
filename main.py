@@ -52,6 +52,18 @@ async def main():
         default="functional",
         help="Verification depth (concept, functional, manufacturing, assembly_ready)"
     )
+    parser.add_argument(
+        "--iterate",
+        type=str,
+        default=None,
+        help="Path to a previous .py script or run directory to iterate on (Human-in-the-Loop iteration)"
+    )
+    parser.add_argument(
+        "--part",
+        type=str,
+        default=None,
+        help="Target a specific part ID within an assembly (optional, used with --iterate)"
+    )
 
     args = parser.parse_args()
 
@@ -77,25 +89,44 @@ async def main():
     print(" 🛠️  ForgeAgent: Multi-Agent Mechanical CAD Generation & Verification")
     print("=" * 70)
     print(f"Run ID:               {run_id}")
+    if args.iterate:
+        print(f"Mode:                 ITERATION (Human-in-the-Loop)")
+        print(f"Target Base:          {args.iterate}")
+        if args.part:
+            print(f"Target Part ID:       {args.part}")
+    else:
+        print(f"Mode:                 NEW DESIGN")
     print(f"Prompt:               {args.prompt}")
     print(f"Manufacturing Process: {process}")
     print(f"Verification Depth:   {args.depth}")
+    gw = GatewayClient()
+    print(f"Primary LLM (.env):   {gw.config.gemini_model}")
+    print(f"Fallback LLM (.env):  {gw.config.groq_model}")
     print(f"Output Directory:     {output_dir}")
     print("-" * 70)
 
-    gw = GatewayClient()
     store = GraphStore()
     executor = LiveGraphExecutor(store)
 
     try:
-        success, graph_state_file = await executor.execute_prompt(
-            prompt=args.prompt,
-            output_dir=output_dir,
-            process=process,
-            depth=args.depth,
-            gateway_client=gw,
-            run_id=run_id
-        )
+        if args.iterate:
+            success, graph_state_file = await executor.execute_iteration(
+                iterate_path=args.iterate,
+                prompt=args.prompt,
+                target_part_id=args.part,
+                output_dir=output_dir,
+                gateway_client=gw,
+                run_id=run_id
+            )
+        else:
+            success, graph_state_file = await executor.execute_prompt(
+                prompt=args.prompt,
+                output_dir=output_dir,
+                process=process,
+                depth=args.depth,
+                gateway_client=gw,
+                run_id=run_id
+            )
     except LLMAPIError as e:
         print(f"\n❌ [LLM API FAILURE] {e}")
         print(f"  • Check your API keys in .env")

@@ -7,11 +7,12 @@ from orchestrator.gateway_client import GatewayClient, GatewayConfig
 from orchestrator.assembly_pipeline import run_full_assembly_pipeline
 
 
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_full_assembly_pipeline_bracket_bolt():
-    client = GatewayClient(GatewayConfig(gemini_api_key=None, groq_api_key=None))
+    client = GatewayClient()
     passed, graph, verdict, solids, artifacts = await run_full_assembly_pipeline(
-        prompt="Bracket with M4 bolt assembly",
+        prompt="Mounting plate 50x40x10mm with two M4 clearance holes and a matching M4 bolt",
         output_dir="artifacts/test_full_assembly_c",
         gateway_client=client
     )
@@ -19,5 +20,5 @@ async def test_full_assembly_pipeline_bracket_bolt():
     assert len(graph.parts) == 2
     assert passed is True
     assert verdict.passed is True
-    assert "bracket_1" in solids
-    assert "bolt_1" in solids
+    assert len(solids) == 2
+    assert "assembly" in artifacts

@@ -43,3 +43,59 @@ def test_verify_assembly_verdict():
     verdict = verify_assembly(parts, joints=[joint])
     assert verdict.passed is True
     assert len(verdict.diagnostics) == 4
+
+
+def test_assembly_compliant_interference_pass():
+    """Verify that intentional compliant/flexible interference (e.g. cam inside flex cup) passes within allowable elastic deflection."""
+    cam = cq.Workplane("XY").ellipse(16.0, 14.0).extrude(10)
+    sleeve = cq.Workplane("XY").circle(20.0).extrude(10).cut(cq.Workplane("XY").circle(15.0).extrude(10))
+
+    parts = {"wave_generator_cam": cam, "flexspline_cup": sleeve}
+    diag = check_interference(parts)
+    assert diag.status == "PASS"
+    assert "Compliant interference verified" in diag.message
+    assert "1.0mm <= 2.5mm" in diag.message
+
+
+def test_assembly_gross_solid_collision_fail():
+    """Verify that massive volumetric collisions (> 30% overlap, e.g. non-hollow solid cup) fail as gross solid collision."""
+    cam = cq.Workplane("XY").ellipse(16.0, 14.0).extrude(10)
+    solid_cup = cq.Workplane("XY").circle(20.0).extrude(10)  # Not hollow!
+
+    parts = {"wave_generator_cam": cam, "flexspline_cup": solid_cup}
+    diag = check_interference(parts)
+    assert diag.status == "FAIL"
+    assert "Gross solid collision" in diag.message
+    assert "Ensure internal cavity is hollow" in diag.message
+
+
+def test_assembly_kinematic_mesh_pass():
+    """Verify that kinematic gear/spline/cycloid tooth mesh within 2.5mm engagement passes without false-positive collision."""
+    ring_with_pins = (
+        cq.Workplane("XY").circle(25.0).extrude(10)
+        .cut(cq.Workplane("XY").circle(20.0).extrude(10))
+        .union(cq.Workplane("XY").polarArray(19.0, 0, 360, 12).circle(1.5).extrude(10))
+    )
+    lobed_disk = (
+        cq.Workplane("XY").circle(18.5).extrude(10)
+        .union(cq.Workplane("XY").polarArray(18.5, 0, 360, 11).circle(1.0).extrude(10))
+    )
+
+    parts = {"housing_ring": ring_with_pins, "cycloid_disk": lobed_disk}
+    diag = check_interference(parts)
+    assert diag.status == "PASS"
+    assert "Compliant interference verified" in diag.message
+
+
+def test_assembly_axial_stacking_collision_fail():
+    """Verify that two solid plates co-located on the same axis without axial offset fail as axial stacking collision."""
+    plate_a = cq.Workplane("XY").circle(20.0).extrude(10)
+    plate_b = cq.Workplane("XY").workplane(offset=2.0).circle(18.0).extrude(10)  # 8mm axial overlap, 80% volume
+
+    parts = {"plate_a": plate_a, "plate_b": plate_b}
+    diag = check_interference(parts)
+    assert diag.status == "FAIL"
+    assert "Axial stacking collision" in diag.message
+
+
+

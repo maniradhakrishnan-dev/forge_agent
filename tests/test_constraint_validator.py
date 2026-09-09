@@ -3,7 +3,7 @@ Unit tests for ConstraintValidator (orchestrator/constraint_validator.py).
 """
 
 from orchestrator.models import AssemblyGraph, PartSpec, MatingContext, JointDef
-from orchestrator.constraint_validator import ConstraintValidator
+from orchestrator.agents.constraint_validator import ConstraintValidator
 
 
 def test_constraint_validator_pass():
@@ -119,5 +119,43 @@ def test_constraint_validator_true_interference_error():
     assert len(res.errors) == 1
     # Ensure error correctly names hole on planet_gear and shaft on planet_carrier (not duplicated, not inverted)
     assert "hole diameter (5.0mm) on 'planet_gear' is smaller than shaft diameter (10.0mm) on 'planet_carrier'" in res.errors[0]
+
+
+def test_constraint_validator_gear_mesh_center_distance_healing():
+    """Gear mesh with mismatched center distance auto-heals to kinematic pitch radius sum."""
+    p1 = PartSpec(
+        id="gear_a",
+        kinematic_params={"module": 1.0, "num_teeth": 20},
+        mates=[MatingContext(partner_id="gear_b", mate_type="gear_mesh")]
+    )
+    p2 = PartSpec(
+        id="gear_b",
+        kinematic_params={"module": 1.0, "num_teeth": 40},
+        mates=[MatingContext(partner_id="gear_a", mate_type="gear_mesh")]
+    )
+    joint = JointDef(id="j1", part_a="gear_a", part_b="gear_b")
+    # Pitch radii are 10.0 and 20.0 -> expected center distance is 30.0.
+    # Provided center distance is 25.0 (incorrect).
+    graph = AssemblyGraph(
+        parts=[p1, p2],
+        joints=[joint],
+        shared_parameters={"center_to_center_distance": 25.0}
+    )
+
+    res = ConstraintValidator.validate(graph)
+    assert res.valid is True
+    assert graph.shared_parameters["center_to_center_distance"] == 30.0
+
+
+def test_constraint_validator_orphan_part_error():
+    """Part without any mates or joints is flagged as an orphan."""
+    p1 = PartSpec(id="housing", mates=[])
+    p2 = PartSpec(id="shaft", mates=[])
+    graph = AssemblyGraph(parts=[p1, p2], joints=[])
+
+    res = ConstraintValidator.validate(graph)
+    assert res.valid is False
+    assert any("Orphan part" in err for err in res.errors)
+
 
 

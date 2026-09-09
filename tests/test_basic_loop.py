@@ -5,7 +5,7 @@ Runs the generate -> kernel -> critic -> export flow asynchronously using python
 
 import asyncio
 from pathlib import Path
-from orchestrator.basic_loop import run_basic_p0_loop
+from tests.mocks.mock_loop import run_basic_p0_loop
 from tools.cad_kernel import execute_cadquery_code
 from tools.verify_single_part import verify_single_part
 

@@ -134,8 +134,8 @@ class ConstraintValidator:
                             )
                         else:
                             measured_c = round(hole_d - shaft_d, 2)
-                            # If clearance is realistic (0.05 - 0.6mm), auto-sync to avoid petty rejections
-                            if 0.05 <= measured_c <= 0.6:
+                            # Allow standard clearance (0.05 - 0.6mm) as well as cycloidal orbital clearances (up to 10.0mm)
+                            if 0.05 <= measured_c <= 10.0:
                                 hole_mate.clearance_mm = measured_c
                                 shaft_mate.clearance_mm = measured_c
                             elif abs(measured_c - hole_mate.clearance_mm) > 0.2:

@@ -31,15 +31,18 @@ class PartSpec(BaseModel):
     name: str = "mounting_bracket"
     description: str = ""
     part_type: str = "mounting_bracket"
+    geometry_form: Optional[str] = None  # e.g., "annular_flanged_casing", "stepped_shaft", "cycloid_disc", "pin_carrier_flange", "bracket", "box_enclosure"
     manufacturing_process: Literal["3d_printing", "cnc_machining", "sheet_metal"] = "3d_printing"
     verification_depth: Literal["concept", "functional", "manufacturing", "assembly_ready"] = "functional"
     length: float = 40.0
     width: float = 30.0
     height: float = 10.0
-    hole_diameter: float = 4.3
+    hole_diameter: float = 0.0
     wall_thickness: float = 4.0
     mates: List[MatingContext] = Field(default_factory=list)
     kinematic_params: Dict[str, Any] = Field(default_factory=dict)
+    explicit_constraints: Dict[str, float] = Field(default_factory=dict)
+    is_single_part: bool = False
     is_compliant: bool = False
     max_deflection_mm: Optional[float] = None
 

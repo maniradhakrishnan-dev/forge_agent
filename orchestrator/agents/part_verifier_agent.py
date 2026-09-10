@@ -52,6 +52,9 @@ class PartVerifierAgent:
         process_floor = PROCESS_MIN_WALL.get(target_process, 1.2)
         effective_min_wall = max(self.min_wall, process_floor)
 
+        explicit_constraints = getattr(spec, "explicit_constraints", {}) if spec else {}
+        is_single_part = getattr(spec, "is_single_part", False) if spec else False
+
         is_gear = False
         requires_hole = False
         if spec:
@@ -59,11 +62,22 @@ class PartVerifierAgent:
             type_lower = spec.part_type.lower()
             id_lower = spec.id.lower()
             is_gear = any(kw in name_lower or kw in type_lower or kw in id_lower for kw in ["gear", "pinion", "casing", "housing", "carrier"])
-            # Auto-infer hole requirements from spec or part semantics
-            if getattr(spec, "hole_diameter", 0.0) and spec.hole_diameter > 0:
+            
+            # Explicit user prompt constraints take absolute precedence
+            if any("hole" in k or "bore" in k for k in explicit_constraints.keys()):
                 requires_hole = True
-            elif any(kw in name_lower or kw in type_lower or kw in id_lower for kw in ["bracket", "plate", "bushing", "pulley", "arm", "link"]):
-                requires_hole = True
+            elif is_single_part:
+                # Standalone single parts (e.g. wrench, bolt, cube, tool, plate) must never require holes
+                # unless explicitly commanded in explicit_constraints
+                requires_hole = False
+            else:
+                is_shaft = any(kw in name_lower or kw in type_lower or kw in id_lower for kw in ["shaft", "axle", "rod", "pin", "bolt", "screw"]) and not any(kw in name_lower for kw in ["hollow", "sleeve", "carrier"])
+                if is_shaft:
+                    requires_hole = False
+                elif any(kw in name_lower or kw in type_lower or kw in id_lower for kw in ["bracket", "bushing", "pulley", "arm", "link", "disc", "flange"]):
+                    requires_hole = True
+                elif getattr(spec, "hole_diameter", 0.0) and spec.hole_diameter > 0 and getattr(spec, "mates", []):
+                    requires_hole = True
 
         return verify_single_part(
             solid_obj,
@@ -76,6 +90,8 @@ class PartVerifierAgent:
             target_height=target_height,
             is_gear=is_gear,
             requires_hole=requires_hole,
+            explicit_constraints=explicit_constraints,
+            is_single_part=is_single_part,
             pillar_filter=pillars
         )
 

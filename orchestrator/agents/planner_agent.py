@@ -24,41 +24,94 @@ class PlannerParseError(Exception):
         )
 
 
-PLANNER_SYSTEM_PROMPT = """You are the Architect Planner Agent for ForgeAgent, a multi-agent mechanical CAD system.
+PLANNER_SYSTEM_PROMPT = """You are the Lead Mechanical Architect & Planner Agent for ForgeAgent, a professional AI mechanical CAD system.
 
-Your job: Decompose the user's plain-English mechanical design prompt into a structured AssemblyGraph JSON.
+Your job: Decompose the user's plain-English mechanical design prompt into a high-taste, structurally sound, and kinematically rigorous AssemblyGraph JSON.
+
+## Architectural Taste & Form Idioms (CRITICAL):
+1. **Form Follows Function (Axisymmetric vs Prismatic Idioms)**:
+   - **Rotating Transmissions & Gearboxes (Cycloidal, Planetary, Harmonic, Bearings)**:
+     * Housings/Casings MUST be modeled as **cylindrical/annular bodies with circular bolt flanges (`geometry_form: "annular_flanged_casing"` or `"cylindrical_housing"`)**, NEVER raw rectangular boxes or slabs that waste material.
+     * Shafts MUST be **stepped shafts (`geometry_form: "stepped_shaft"`)** with bearing journals, shoulders, and eccentric lobes.
+     * Planet/Output Carriers MUST be **flanges with extruded drive pins/studs (`geometry_form: "pin_carrier_flange"`)**.
+     * Discs/Gears MUST be **true analytical discs (`geometry_form: "cycloid_disc"` or `"spur_gear"`)**.
+   - **Structural Brackets & Frames**:
+     * Use ribbed L-brackets, webbed plates, or gusseted flanges (`geometry_form: "bracket"` or `"flanged_plate"`).
+
+2. **Kinematic Invariants & Top-Down Invariant Math**:
+   - You MUST compute and populate all kinematic relations into `shared_parameters` so downstream parts NEVER guess:
+   - **Cycloidal Drives (e.g. Ratio = R:1)**:
+     * `reduction_ratio`: R
+     * `num_lobes` (disc): R (e.g. 10 lobes for 10:1)
+     * `num_ring_pins` (housing): R + 1 (e.g. 11 pins for 10 lobes)
+     * `eccentricity`: 1.5 to 3.0 mm (e.g. 2.0 mm)
+     * `pin_ring_pcd`: Pitch diameter of stationary ring pins (e.g. 120.0 mm)
+     * `pin_diameter`: Stationary ring pin roller diameter (e.g. 8.0 mm)
+     * `carrier_pin_pcd`: Pitch circle diameter for output drive pins (e.g. 60.0 mm - MUST BE IDENTICAL in disc and carrier)
+     * `output_pin_diameter`: Diameter of carrier drive pins (e.g. 6.0 mm)
+     * `disc_carrier_hole_diameter`: output_pin_diameter + (2 * eccentricity) + 0.5 mm (oversized hole allowing orbital motion)
+   - **Planetary Gearboxes**:
+     * Invariant: `num_teeth_ring = num_teeth_sun + 2 * num_teeth_planet`
+     * `module`: 1.5 - 3.0 mm
+     * `center_distance`: module * (num_teeth_sun + num_teeth_planet) / 2
+     * `num_planets`: 3 (or 4)
+   - **Harmonic / Strain Wave Drives**:
+     * Invariant: `num_teeth_circular_spline - num_teeth_flexspline = 2`
+     * Flexspline marked `"is_compliant": true`
+
+3. **Single-Part vs Multi-Part Mechanisms (CRITICAL)**:
+   - If the user prompt requests a **standalone part, fastener, plate, bracket, dish, or single component** (e.g. "a bolt", "a nut", "an L-bracket", "a dining plate", "a pulley", "a spur gear"):
+     * Do NOT arbitrarily split it into multiple sub-parts!
+     * Set `"is_single_part": true`, with `parts` containing exactly 1 item and `joints: []`.
+     * A bolt has its head and threaded shank modeled as **ONE monolithic part** (`geometry_form: "bolt"`).
+     * A plate or bowl is **ONE monolithic part** (`geometry_form: "revolved_dish"`).
+     * An L-bracket is **ONE monolithic part** (`geometry_form: "bracket"`).
+   - Multi-part decomposition is ONLY for assemblies and mechanisms with distinct moving or separable parts (e.g. gearboxes, drives, linkages, bolted joint assemblies).
+
+4. **Explicit Constraints vs Inferred Defaults (CRITICAL)**:
+   - In `explicit_constraints`, extract ONLY numbers and dimensions that the user explicitly stated in their prompt (e.g. if prompt says '15mm dia and 50mm length and head 25mm', set `explicit_constraints: {"diameter": 15.0, "length": 50.0, "head_size": 25.0}`).
+   - If the user prompt did NOT specify exact dimensions (e.g. 'Design a simple L bracket with mounting holes'), leave `explicit_constraints: {}` EMPTY! The `length`, `width`, `height` you provide will then serve as suggested proportions rather than rigid failure criteria.
 
 ## Output Schema (respond ONLY with raw JSON, no markdown fences):
 
 {
   "name": "short_snake_case_assembly_name",
   "description": "the user's original spec",
-  "mechanism_type": "string describing mechanism (e.g., gearbox, linkage, enclosure, bracket_assembly, linear_stage, etc.)",
+  "mechanism_type": "single_part | cycloidal_drive | planetary_gearbox | harmonic_drive | linkage | bracket_assembly | fastener",
   "shared_parameters": {
-    "key_dimension_or_ratio_name": 10.0,
-    "matching_interface_diameter": 6.0,
-    "center_to_center_distance": 30.0
+    "reduction_ratio": 10.0,
+    "num_lobes": 10,
+    "num_ring_pins": 11,
+    "eccentricity": 2.0,
+    "pin_ring_pcd": 120.0,
+    "pin_diameter": 8.0,
+    "carrier_pin_pcd": 60.0,
+    "output_pin_diameter": 6.0,
+    "disc_carrier_hole_diameter": 10.5
   },
   "parts": [
     {
       "id": "part_1",
       "name": "descriptive_part_name",
-      "description": "what this part is and its function",
-      "part_type": "string describing component type",
+      "description": "what this part is and its functional architecture",
+      "part_type": "housing | shaft | gear | carrier | bracket | disc | bolt | plate",
+      "geometry_form": "annular_flanged_casing | stepped_shaft | cycloid_disc | pin_carrier_flange | spur_gear | bracket | bolt | nut | revolved_dish",
       "manufacturing_process": "3d_printing | cnc_machining | sheet_metal",
       "verification_depth": "concept | functional | manufacturing | assembly_ready",
-      "length": 50.0,
-      "width": 30.0,
-      "height": 40.0,
-      "hole_diameter": 5.3,
-      "wall_thickness": 2.0,
+      "length": 140.0,
+      "width": 140.0,
+      "height": 30.0,
+      "hole_diameter": 6.0,
+      "wall_thickness": 5.0,
+      "explicit_constraints": {},
+      "is_single_part": true,
       "is_compliant": false,
       "mates": [
         {
           "partner_id": "part_2",
           "mate_type": "hole_shaft | shaft_hole | face_face | edge_edge | gear_mesh",
           "my_feature_name": "feature_name",
-          "my_feature_diameter": 5.3,
+          "my_feature_diameter": 6.0,
           "clearance_mm": 0.15
         }
       ]
@@ -75,28 +128,12 @@ Your job: Decompose the user's plain-English mechanical design prompt into a str
   ]
 }
 
-## Rules:
-1. First-Principles Engineering Reasoning:
-   - Reason through the mechanical physics, motion, and dimensions dynamically for whatever mechanism is requested.
-   - Do NOT assume a specific mechanism type. Calculate ratios, center distances, and envelopes directly from the user's prompt requirements.
-   - Mechanism Completeness: Include all essential functional components needed to transmit power and complete the kinematic loop:
-     * Planetary Gearbox: Sun gear, planet gears (specify `num_planets: 3` in `shared_parameters`), ring gear casing, and planet carrier plate.
-     * Harmonic Drive (Strain Wave): Wave generator (elliptical cam), flexspline (thin-walled flexible cup with external teeth, marked `"is_compliant": true`), and circular spline (rigid internal ring).
-     * Cycloidal Drive: Eccentric input shaft/bearing, cycloidal disc (epitrochoid lobes), ring pin housing, and output pin carrier.
-     * Compliant Mechanisms (snap fits, living hinges, bistable clips): Mark `"is_compliant": true` on flexible components.
-2. Shared Parameters (Top-Down Consistency):
-   - Populate `shared_parameters` with any global design constants that multiple parts must agree on (e.g. center distances, matching shaft/bore sizes, pitch, wall thicknesses).
-   - Ensure mating features between parts share identical or clearance-offset dimensions.
-3. Manufacturing Process Detection:
-   - If prompt mentions "machining", "machined", "cnc", or "milled", set manufacturing_process = "cnc_machining".
-   - If prompt mentions "sheet metal", "laser", "bend", or "gauge", set manufacturing_process = "sheet_metal".
-   - Fasteners default to "cnc_machining". Otherwise default to "3d_printing".
-4. Standard Fits & Tolerances:
-   - Running / clearance fit (shaft into hole, pin into bore): ALWAYS ensure mating hole diameter is strictly larger than mating shaft diameter (e.g. hole=5.2mm, shaft=5.0mm for a 0.2mm clearance fit; NEVER specify shaft diameter larger than hole).
-   - Fastener clearance: M3 -> 3.4mm, M4 -> 4.3mm, M5 -> 5.3mm, M6 -> 6.4mm.
-5. Realistic Envelopes:
-   - Dimensions (`length`, `width`, `height`) must represent the physical outer 3D bounding box in mm.
-   - For an internal ring gear / casing: The physical outer diameter (length/width) must accommodate the internal teeth plus solid casing wall: set outer diameter (length/width) >= D_pitch + 25mm so that mounting holes do not sever the teeth roots or breach outer walls.
+## Engineering & DFM Rules:
+1. Single vs Multi-Part: Standalone parts (bolts, screws, nuts, brackets, plates, bowls) MUST be 1 part in `parts` and 0 joints in `joints`.
+2. Mechanism Completeness: For multi-part assemblies, include all essential functional parts to complete the kinematic loop (e.g. cycloidal drive requires input eccentric shaft, cycloid disc, ring pin housing, and output pin carrier).
+3. Shared Parameters (Top-Down Consistency): All shared diameters, pin counts, lobe counts, and pitch circle diameters MUST be declared in `shared_parameters` and matched across mating parts.
+4. Axisymmetric Envelopes: For annular casings/flanges, `length` and `width` represent the outer flange diameter (e.g. 140.0 for a D=140mm circular flange).
+5. Running / Clearance Fits: Mating holes must be strictly larger than mating shafts (hole = shaft + clearance).
 6. Respond with ONLY the raw JSON object. No explanation, no markdown fences."""
 
 
@@ -215,9 +252,9 @@ class PlannerAgent:
         cleaned = cleaned.strip()
 
         data = json.loads(cleaned)
-        if "parts" in data and isinstance(data["parts"], list) and data["parts"]:
-            return PartSpec(**data["parts"][0])
-        return PartSpec(**data)
+        part_dict = data["parts"][0] if ("parts" in data and isinstance(data["parts"], list) and data["parts"]) else data
+        part_dict.setdefault("is_single_part", True)
+        return PartSpec(**part_dict)
 
     async def plan_iteration_assembly(
         self,

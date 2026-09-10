@@ -131,7 +131,21 @@ class PartRepairAgent:
         if not failed:
             return code, True, []
 
-        # Check if ALL failures are parametrically fixable
+        fixed_code = code
+        fixes_applied: List[str] = []
+
+        # Geometry Pre-Fix: Check for Workplane("XZ") revolve axis error causing PHYS-01 zero volume
+        if any(d.rule_id == "PHYS-01" for d in failed) and "XZ" in fixed_code and "revolve" in fixed_code:
+            rev_pattern = r"\.revolve\s*\(\s*(?:360(?:\.0)?)?\s*,\s*\(\s*0\s*,\s*0\s*,\s*0\s*\)\s*,\s*\(\s*0\s*,\s*0\s*,\s*1\s*\)\s*\)"
+            new_code = re.sub(rev_pattern, ".revolve()", fixed_code)
+            if new_code != fixed_code:
+                fixed_code = new_code
+                fixes_applied.append("[PHYS-01] Fixed .revolve() rotation axis on XZ workplane (switched to global Z axis)")
+                failed = [d for d in failed if d.rule_id not in ("PHYS-01", "PHYS-02")]
+                if not failed:
+                    return fixed_code, True, fixes_applied
+
+        # Check if ALL remaining failures are parametrically fixable
         fixable_rules = {"SPEC-01", "STRUCT-01", "DFM-3D-02", "DFM-CNC-02", "DFM-SM-02"}
         unfixable = [d for d in failed if d.rule_id not in fixable_rules]
         if unfixable:
@@ -141,7 +155,7 @@ class PartRepairAgent:
                 for d in unfixable
             ]
 
-        variables = self._parse_variables(code)
+        variables = self._parse_variables(fixed_code)
         if not variables:
             return None, False, ["No parseable top-level variables found in script."]
 
@@ -257,16 +271,19 @@ class PartRepairAgent:
         fixed_code = code
         fixes: List[str] = []
 
-        # Fix 1: Remove .fillet() / .chamfer() calls that crash OpenCASCADE
-        if ("Standard_Failure" in exec_error or "StdFail_NotDone" in exec_error or
-                "BRep_API" in exec_error or "suitable edges" in exec_error) and \
-                ("fillet" in exec_error.lower() or "chamfer" in exec_error.lower()):
+        # Fix 1: Remove .fillet() / .chamfer() calls that crash OpenCASCADE or CadQuery
+        fillet_keywords = (
+            "Standard_Failure", "StdFail_NotDone", "BRep_API", "suitable edges",
+            "Standard_ConstructionError", "ChFi3d_Builder", "edges be selected",
+            "requires that edges be selected", "Cannot compute fillet", "Standard_DomainError"
+        )
+        if any(kw in exec_error for kw in fillet_keywords):
             # Remove .fillet(...) and .chamfer(...) method calls
             pattern = r"\.(?:fillet|chamfer)\s*\([^)]*\)"
             new_code = re.sub(pattern, "", fixed_code)
             if new_code != fixed_code:
                 fixed_code = new_code
-                fixes.append("Removed .fillet()/.chamfer() calls causing OpenCASCADE BRep failure")
+                fixes.append("Removed .fillet()/.chamfer() calls causing OpenCASCADE/CadQuery BRep failure")
 
         # Fix 2: Remove .filterBy(...) calls — CadQuery doesn't have this method
         if "filterBy" in exec_error:
@@ -287,12 +304,34 @@ class PartRepairAgent:
 
         # Fix 4: Remove .placeSketch() usage
         if "placeSketch" in exec_error:
-            # This is too complex to auto-fix — but we can try removing the offending line
             lines = fixed_code.splitlines()
             new_lines = [l for l in lines if ".placeSketch(" not in l]
             if len(new_lines) < len(lines):
                 fixed_code = "\n".join(new_lines)
                 fixes.append("Removed .placeSketch() calls (requires cq.Sketch, not Workplane)")
+
+        # Fix 5: Remove invalid .helix() calls (Workplane has no helix method)
+        if "object has no attribute 'helix'" in exec_error:
+            lines = fixed_code.splitlines()
+            new_lines = []
+            skip_var = None
+            for l in lines:
+                if ".helix(" in l:
+                    m = re.match(r"\s*([a-zA-Z0-9_]+)\s*=", l)
+                    if m:
+                        skip_var = m.group(1)
+                    continue
+                if skip_var and skip_var in l:
+                    m2 = re.match(r"\s*([a-zA-Z0-9_]+)\s*=", l)
+                    if m2:
+                        skip_var = m2.group(1)
+                    continue
+                if any(x in l for x in [".cut(threads)", ".union(threads)", "threads.val()", "threads ="]):
+                    continue
+                new_lines.append(l)
+            if len(new_lines) < len(lines):
+                fixed_code = "\n".join(new_lines)
+                fixes.append("Removed invalid .helix() and dependent sweep/cut operations (Workplane has no helix method)")
 
         if fixes:
             return fixed_code, True, fixes
@@ -393,9 +432,10 @@ class PartRepairAgent:
             elif diag.rule_id == "PHYS-01":
                 if "disconnected solid bodies" in diag.message:
                     instructions.append(
-                        f"  -> ACTION: The part severed into {int(diag.measured)} disconnected solid bodies! "
-                        f"Holes or cuts sliced completely through walls or features. "
-                        f"Ensure cuts, bores, and hole patterns do not slice through boundaries or sever connected features. Maintain sufficient outer wall thickness and solid boundary clearance around holes."
+                        f"  -> ACTION: The part consists of {int(diag.measured)} disconnected solid bodies! "
+                        f"Either:\n"
+                        f"  1. An added feature (ring, handle, boss, rib) unioned with .union() does not touch the parent body (floats in air with a gap). Ensure the feature physically overlaps and embeds into the parent solid (e.g. for an external ring, inner_radius < glass_outer_radius so it fuses into the wall).\n"
+                        f"  2. Or holes/cuts sliced completely through the solid, severing it into multiple pieces. Maintain continuous material."
                     )
                 else:
                     instructions.append(

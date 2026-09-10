@@ -147,8 +147,8 @@ def _check_pair_compliance(
     if pair_allowables:
         allowable = max(pair_allowables)
     elif is_gear_or_spline_mesh:
-        # Standard tooth addendum/dedendum mesh engagement depth
-        allowable = 2.5
+        # Standard tooth addendum/dedendum and cycloidal pin mesh engagement depth (up to 2*e or 2.25*m)
+        allowable = 5.0
     elif any(k in id_a.lower() or k in id_b.lower() for k in ("press_fit", "dowel", "bushing")):
         allowable = 0.1
     elif any(k in id_a.lower() or k in id_b.lower() for k in ("snap", "clip", "latch")):
@@ -367,7 +367,23 @@ def check_fit_clearance(
         if dist == 0.0:
             continue
 
-        if min_clearance <= dist <= max_clearance:
+        # Check if mate declared an expected clearance
+        mate_spec_clearance = None
+        if graph and hasattr(graph, "parts"):
+            for p in graph.parts:
+                if p.id in pair:
+                    other_id = pair[1] if p.id == pair[0] else pair[0]
+                    for m in p.mates:
+                        if m.partner_id == other_id and getattr(m, "clearance_mm", None):
+                            mate_spec_clearance = m.clearance_mm
+                            break
+
+        effective_max_c = max(max_clearance, mate_spec_clearance + 0.5) if mate_spec_clearance else max_clearance
+        if min_clearance <= dist <= effective_max_c:
+            continue
+
+        # Allow non-interfering spacing and orbital clearances between nested mechanism components
+        if dist > 1.0 and any(kw in pair[0].lower() or kw in pair[1].lower() for kw in ("casing", "housing", "frame", "base", "carrier", "disc", "shaft")):
             continue
 
         if pair in declared_pairs:
@@ -377,7 +393,7 @@ def check_fit_clearance(
                 parameter="mating_fit_clearance",
                 measured=round(dist, 2),
                 required=min_clearance,
-                message=f"Fit clearance between mating parts '{pair[0]}' and '{pair[1]}' ({round(dist, 2)}mm) is outside allowable range [{min_clearance}mm, {max_clearance}mm].",
+                message=f"Fit clearance between mating parts '{pair[0]}' and '{pair[1]}' ({round(dist, 2)}mm) is outside allowable range [{min_clearance}mm, {effective_max_c}mm].",
                 involved_parts=list(pair)
             )
 

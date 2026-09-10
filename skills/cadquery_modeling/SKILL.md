@@ -30,25 +30,81 @@ result = (
 ```
 
 ### CRITICAL: CadQuery Workplane Local Coordinate System & Holes
-When you select a face with `.faces(">Z").workplane()`, the local origin `(0, 0)` is at the **center of the selected face**, NOT at global `(0, 0, 0)`.
-- If you want a hole at the center of the face, simply call `.hole(diameter)`.
-- If you want multiple holes symmetrically spaced, use `.pushPoints([(-spacing/2, 0), (spacing/2, 0)]).hole(diameter)`.
+When selecting a face with `.faces(...)`, CadQuery's default workplane mode is `"ProjectedOrigin"`, which projects the PREVIOUS workplane's origin onto the face.
+- **ALWAYS use `.workplane(centerOption="CenterOfMass")` or `.workplane(centerOption="CenterOfBoundBox")` when placing holes or features on faces!**
+  If you do not specify `centerOption="CenterOfMass"`, moving between faces (e.g. drilling `>Z` then `>X`) causes CadQuery to offset the origin onto the outer edge seam `(50, 0, 50)`, drilling a slot/groove into the corner rather than a centered hole!
+- **Holes Through a 3D Solid / Cube:**
+  Calling `.hole(diameter)` cuts through the entire solid. E.g. drilling on `>Z` penetrates both +Z and -Z faces.
+  Canonical pattern for a perforated cube (e.g. 100x100x100mm cube with centered holes on each face):
+  ```python
+  result = (
+      cq.Workplane("XY")
+      .box(100.0, 100.0, 100.0)
+      .faces(">Z").workplane(centerOption="CenterOfMass").hole(5.0)
+      .faces(">X").workplane(centerOption="CenterOfMass").hole(5.0)
+      .faces(">Y").workplane(centerOption="CenterOfMass").hole(5.0)
+  )
+  ```
 - **Global Interface Coordinates:** In `# INTERFACE: name=(x,y,z)...`, specify the exact GLOBAL world coordinate of the hole! For a box centered at `(0, 0, 0)` with height $H$, the top face is at $Z = +H/2$. So holes at local $(\pm 15, 0)$ have global coordinates `(±15, 0, H/2)`.
-- **Brackets & Plates:** Always start with `cq.Workplane("XY").box(length, width, thickness)` so the part is cleanly centered. For an L-bracket, union two centered boxes:
+- **Brackets & Angle Plates (Extruded 2D Profile Idiom):**
+  Always construct L-brackets, U-channels, and angle brackets by drawing a 2D polyline profile on the XZ plane and extruding along Y:
   ```python
-  base = cq.Workplane("XY").box(length, width, thickness).translate((0, 0, thickness / 2))
-  upright = cq.Workplane("XY").box(thickness, width, height).translate((-length / 2 + thickness / 2, 0, height / 2))
-  result = base.union(upright)
-  # Drill hole through base:
-  result = result.faces(">Z and <X").workplane().hole(hole_dia)
+  pts = [
+      (0, 0),
+      (length, 0),
+      (length, thickness),
+      (thickness, thickness),
+      (thickness, height),
+      (0, height)
+  ]
+  result = cq.Workplane("XZ").polyline(pts).close().extrude(width)
+  # Mounting hole in base plate (centered on base leg):
+  result = result.faces(">Z and <X").workplane(centerOption="CenterOfBoundBox").hole(hole_dia)
+  # Mounting hole in upright leg:
+  result = result.faces("<X").workplane(centerOption="CenterOfBoundBox").hole(hole_dia)
   ```
-- **Bolts & Fasteners:** Construct with head on XY plane extending in $+Z$ and shaft extending in $-Z$:
+  *(Note: NEVER use `.extrude(width, both=True)` without halving width — `both=True` extrudes `width` in both directions, making total length $2 \times \text{width}$!)*
+
+- **Bolts, Screws & Threaded Fasteners (Monolithic Single-Part Idiom):**
+  A bolt or screw is always modeled as ONE single part with the head and shank unioned:
   ```python
-  head = cq.Workplane("XY").polygon(6, width_across_flats, circumscribed=False).extrude(head_height)
-  shaft = cq.Workplane("XY").circle(nominal_diameter / 2.0).extrude(-shaft_length)
+  # Hexagonal head (extending in +Z)
+  head = cq.Workplane("XY").polygon(6, head_dia, circumscribed=False).extrude(head_height)
+  # Concentric shank (extending in -Z)
+  shaft = cq.Workplane("XY").circle(nominal_dia / 2.0).extrude(-shaft_length)
   result = head.union(shaft)
-  # INTERFACE: bolt_shank=(0,0,0) dir=(0,0,-1) type=shaft d=5.0
+  # Lead-in chamfers at tip:
+  result = result.faces("<Z").edges("%CIRCLE").chamfer(1.0)
+  # INTERFACE: bolt_shank=(0,0,0) dir=(0,0,-1) type=shaft d=nominal_dia
   ```
+  **CRITICAL THREADING RULE**:
+  CadQuery Workplane has **NO `.helix()` method**! NEVER call `cq.Workplane().helix(...)` (causes fatal `AttributeError`).
+  In mechanical CAD kernels, 3D helical sweeps for standard fasteners are avoided because OpenCASCADE helical boolean operations frequently fail with `BRep_API: command not done`.
+  Fastener threads must be modeled as a nominal cylinder diameter with standard 45°/60° lead-in chamfer at `<Z`. If cosmetic threads are desired, use annular cuts. NEVER call `.helix()` on a Workplane!
+
+- **Plates, Dishes, Bowls & Revolved Parts (Revolve 360 Idiom):**
+  Construct dining plates, shallow bowls, bushings, and pulleys using a single 2D closed polygon cross-section on the XZ plane revolved 360° around the Z axis (all X coordinates must be $\ge 0$):
+  ```python
+  pts = [
+      (0, 0),
+      (base_dia / 2.0, 0),
+      (rim_dia / 2.0, height),
+      (rim_dia / 2.0 - rim_lip_width, height),
+      (base_dia / 2.0 - wall_thickness, base_thickness),
+      (0, base_thickness)
+  ]
+  # Simply call .revolve() without arguments on 'XZ' workplane (rotates around global Z axis):
+  result = cq.Workplane("XZ").polyline(pts).close().revolve()
+  ```
+  *(CRITICAL: On a `Workplane("XZ")`, calling `.revolve()` with default arguments rotates around the global Z axis. NEVER pass `axisEnd=(0, 0, 1)` because `(0, 0, 1)` is the workplane normal, which rotates the sketch in-plane and creates a 0-volume sheet!)*
+
+- **Attached Features & Rings (Union Overlap Idiom):**
+  When adding external rings, collars, handles, lugs, or bosses to an existing body using `.union(feature)`:
+  The added feature MUST physically embed/overlap into the parent body (embed by $\ge 0.5\text{mm}$).
+  For example, for a ring or collar around a tapered vessel/cylinder with outer radius $R(z)$ at height $z$:
+  - The ring's inner radius MUST be slightly smaller than the outer radius of the parent wall (e.g. $R_{\text{inner}} = R(z) - 1.0\text{mm}$).
+  - The ring's outer radius MUST be larger (e.g. $R_{\text{outer}} = R(z) + 10.0\text{mm}$).
+  - If $R_{\text{inner}} \ge R(z)$, the ring floats in midair with a gap, producing 2 disconnected solid bodies and failing manifold verification (`PHYS-01`).
 
 ## 3. Key CadQuery Operations
 - **Box:** `cq.Workplane("XY").box(length_x, width_y, height_z)`
@@ -57,11 +113,14 @@ When you select a face with `.faces(">Z").workplane()`, the local origin `(0, 0)
 - **Pattern Holes (Rectangular):** `.rectArray(xSpacing, ySpacing, xCount, yCount).hole(diameter)`
 - **Pattern Holes (Circular/Polar):** `.polarArray(radius, startAngle, angle, count).hole(diameter)` (NOTE: first argument is `radius`, NEVER `startRadius`!)
 - **Fillet Edges:** `.edges("|Z").fillet(radius)` (Fillet vertical edges)
-- **Chamfer Edges:** `.edges(">Z").chamfer(distance)`
+- **Chamfer Edges:** `.faces(">Z").edges("%CIRCLE").chamfer(distance)`
 
-## 4. Design Guidelines
-- Ensure all clearance holes match standard bolt clearance diameters (e.g. M4 clearance = $4.3\text{mm}$, M5 clearance = $5.3\text{mm}$).
+## 4. Design & Safety Guidelines
+- Ensure all clearance holes match standard bolt clearance diameters (e.g. M4 clearance = $4.3\text{mm}$, M5 clearance = $5.3\text{mm}$, M6 clearance = $6.5\text{mm}$).
 - Maintain wall thickness $\ge 1.5\text{mm}$ between holes and outer boundaries.
+- **Filleting / Chamfering Safety:** 
+  * Never call `.edges().fillet()` or `.edges().chamfer()` blindly on an entire solid after boolean union/cut operations. OpenCascade will crash with `Standard_ConstructionError: ChFi3d_Builder:only 2 faces` or `Fillets requires that edges be selected`.
+  * Select specific circular edges via `.faces(">Z").edges("%CIRCLE").fillet(...)` or omit cosmetic edge fillets if not strictly required.
 
 ## 5. Coding Safety & Execution Rules
 - **Variable Scope:** Define ALL mathematical variables (e.g. `pitch_dia`, `r_outer`, `module`, `num_teeth`, `twist_angle`) AT THE TOP of the script before using them in expressions.
@@ -227,72 +286,89 @@ result = result.faces(">Z").workplane().polarArray(center_to_center_distance, 0,
 
 ## 10. Cycloidal Drive Modeling Pattern
 
-### A. Cycloid Disk (Multi-Lobe Cam Profile)
-To create a watertight, smooth cycloid disk with $N$ lobes (e.g. 29, 39, or 49 lobes) that avoids self-intersecting root loops:
+### A. True Analytical Cycloid Disc (Equidistant Epitrochoid Math)
+To create a mathematically conjugate, smooth cycloidal disc profile that rolls seamlessly against stationary ring pins with conjugate action:
+
 ```python
 import cadquery as cq
 import math
 
-# Parameters
-pitch_dia = 70.0
-eccentricity = 1.2
-num_lobes = 29  # For 30:1 or 50:1 cycloidal gear drive
-disk_thickness = 8.0
-center_bore_dia = 15.0  # Bearing fit for eccentric input shaft
-pin_circle_dia = 42.0
-num_pin_holes = 6
-pin_hole_dia = 10.0  # Oversized: pin_dia + 2*eccentricity
+# Shared Kinematic Invariants
+num_lobes = 10          # Z lobes for 10:1 reduction
+num_ring_pins = 11      # N = Z + 1
+pin_ring_dia = 120.0    # Pin ring pitch diameter (2 * Rp)
+pin_dia = 8.0           # Stationary pin roller diameter (2 * Rr)
+eccentricity = 2.0      # Eccentric shaft offset (e)
+carrier_pin_pcd = 60.0  # Shared PCD for carrier drive pins
+output_pin_dia = 6.0    # Diameter of carrier drive studs
+disc_thickness = 15.0
 
-r_base = pitch_dia / 2.0
+# Mathematical constants
+Rp = pin_ring_dia / 2.0
+Rr = (pin_dia / 2.0) + 0.05  # slight clearance offset for smooth rolling
+e = eccentricity
+Z = num_lobes
 
-# 1. Generate smooth, non-self-intersecting multi-lobe profile
-num_pts = max(360, num_lobes * 12)
+# 1. Generate exact analytical equidistant curve of epitrochoid
+num_pts = 720
 pts = []
 for i in range(num_pts):
     theta = 2.0 * math.pi * i / num_pts
-    r = r_base + eccentricity * math.cos(num_lobes * theta)
-    pts.append((r * math.cos(theta), r * math.sin(theta)))
+    denom = (Rp / (e * (Z + 1))) - math.cos(Z * theta)
+    numer = math.sin(Z * theta)
+    psi = math.atan2(numer, denom)
+    x = Rp * math.cos(theta) - e * math.cos((Z + 1) * theta) - Rr * math.cos(theta + psi)
+    y = Rp * math.sin(theta) - e * math.sin((Z + 1) * theta) - Rr * math.sin(theta + psi)
+    pts.append((x, y))
 
-result = cq.Workplane("XY").polyline(pts).close().extrude(disk_thickness)
+result = cq.Workplane("XY").polyline(pts).close().extrude(disc_thickness)
 
-# 2. Central bearing bore for eccentric shaft
+# 2. Central bearing bore for eccentric input lobe
+center_bore_dia = 25.1
 result = result.faces(">Z").workplane().hole(center_bore_dia)
 
-# 3. Carrier pin drive holes
+# 3. Carrier drive pin holes (oversized to allow orbiting motion: D = d_pin + 2*e + 0.5)
+carrier_hole_dia = output_pin_dia + (2.0 * eccentricity) + 0.5
 result = (
     result.faces(">Z").workplane()
-    .polarArray(pin_circle_dia / 2.0, 0, 360, num_pin_holes)
-    .hole(pin_hole_dia)
+    .polarArray(carrier_pin_pcd / 2.0, 0, 360, 6)
+    .hole(carrier_hole_dia)
 )
 
-# INTERFACE: disk_bore=(0,0,disk_thickness/2) dir=(0,0,1) type=hole d=15.0
-# INTERFACE: pin_holes=(21.0,0,disk_thickness/2) dir=(0,0,1) type=hole d=10.0
-# INTERFACE: lobe_profile=(0,0,disk_thickness/2) dir=(0,0,1) type=gear_mesh d=70.0
+# INTERFACE: center_bore=(0,0,disc_thickness/2) dir=(0,0,1) type=hole d=25.1
+# INTERFACE: cycloid_profile=(0,0,disc_thickness/2) dir=(0,0,1) type=gear_mesh d=120.0
+# INTERFACE: drive_holes=(30.0,0,disc_thickness/2) dir=(0,0,1) type=hole d=10.5
 ```
 
-### B. Stationary Ring Housing with Outer Pin Rollers
-To create the cycloidal ring housing:
+### B. Stationary Ring Housing with Circular Bolt Flange (Annular Flanged Casing)
+Always model gearbox casings as axisymmetric annular bodies with circular mounting flanges:
+
 ```python
 import cadquery as cq
 import math
 
-outer_dia = 100.0
-pin_ring_dia = 72.0
-pin_dia = 5.0
-num_pins = 30  # num_lobes + 1
-housing_height = 16.0
+pin_ring_dia = 120.0
+pin_dia = 8.0
+num_pins = 11
+housing_od = 136.0
+flange_dia = 160.0
+flange_thickness = 8.0
+housing_height = 30.0
+mounting_pcd = 148.0
+mounting_hole_dia = 5.3
 
-# 1. Outer cylindrical casing
-casing = cq.Workplane("XY").circle(outer_dia / 2.0).extrude(housing_height)
+# 1. Outer cylindrical casing body
+casing = cq.Workplane("XY").circle(housing_od / 2.0).extrude(housing_height)
 
-# 2. Inner cavity for cycloid disk:
-# Bore radius MUST be cut at pin_ring_dia / 2.0 (the center circle of the pins).
-# This ensures the outer half of each pin embeds solidly into the outer casing wall,
-# creating a single watertight manifold without disconnected solids or non-manifold edges.
+# 2. Outer circular mounting flange
+flange = cq.Workplane("XY").circle(flange_dia / 2.0).extrude(flange_thickness)
+result = casing.union(flange)
+
+# 3. Inner cavity cut (bore cut at pin center circle)
 cavity = cq.Workplane("XY").circle(pin_ring_dia / 2.0).extrude(housing_height)
-result = casing.cut(cavity)
+result = result.cut(cavity)
 
-# 3. Stationary pin rollers arrayed along internal circumference
+# 4. Stationary pin rollers embedded into inner wall
 pins = (
     cq.Workplane("XY")
     .polarArray(pin_ring_dia / 2.0, 0, 360, num_pins)
@@ -301,17 +377,74 @@ pins = (
 )
 result = result.union(pins)
 
-# 4. Mounting holes on outer flange (optional)
-# Place mounting holes on PCD > (pin_ring_dia + pin_dia + 6.0) to maintain solid wall thickness
-mounting_pcd = outer_dia - 12.0
+# 5. Mounting holes on circular flange
 result = (
     result.faces(">Z").workplane()
     .polarArray(mounting_pcd / 2.0, 0, 360, 6)
-    .hole(4.3)
+    .hole(mounting_hole_dia)
 )
 
-# INTERFACE: ring_pins=(0,0,housing_height/2) dir=(0,0,1) type=gear_mesh d=72.0
-# INTERFACE: mounting_flange=(0,0,housing_height) dir=(0,0,1) type=face d=100.0
+# INTERFACE: ring_pins=(0,0,housing_height/2) dir=(0,0,1) type=gear_mesh d=120.0
+# INTERFACE: mounting_flange=(0,0,0) dir=(0,0,-1) type=face d=160.0
+```
+
+### C. Output Pin Carrier Flange with Extruded Drive Studs
+```python
+import cadquery as cq
+
+plate_dia = 100.0
+plate_thickness = 8.0
+carrier_pin_pcd = 60.0
+output_pin_dia = 6.0
+pin_height = 17.0  # disc_thickness + 2mm
+center_shaft_dia = 15.0
+
+# 1. Base circular carrier plate
+plate = cq.Workplane("XY").circle(plate_dia / 2.0).extrude(plate_thickness)
+
+# 2. Extruded drive studs that capture the cycloid disc
+studs = (
+    cq.Workplane("XY")
+    .workplane(offset=plate_thickness)
+    .polarArray(carrier_pin_pcd / 2.0, 0, 360, 6)
+    .circle(output_pin_dia / 2.0)
+    .extrude(pin_height)
+)
+result = plate.union(studs)
+
+# 3. Output shaft / bearing bore
+result = result.faces("<Z").workplane().hole(center_shaft_dia)
+
+# INTERFACE: drive_studs=(30.0,0,plate_thickness + pin_height/2) dir=(0,0,1) type=pin d=6.0
+# INTERFACE: output_bore=(0,0,plate_thickness/2) dir=(0,0,-1) type=shaft d=15.0
+```
+
+### D. Stepped Input Shaft with Eccentric Lobe
+```python
+import cadquery as cq
+
+eccentricity = 2.0
+main_shaft_dia = 12.0
+lobe_dia = 25.0
+lobe_thickness = 15.0
+total_length = 60.0
+lobe_z_start = 10.0
+
+# 1. Main concentric shaft
+shaft = cq.Workplane("XY").circle(main_shaft_dia / 2.0).extrude(total_length)
+
+# 2. Eccentric driving lobe offset along X
+lobe = (
+    cq.Workplane("XY")
+    .workplane(offset=lobe_z_start)
+    .moveTo(eccentricity, 0)
+    .circle(lobe_dia / 2.0)
+    .extrude(lobe_thickness)
+)
+result = shaft.union(lobe)
+
+# INTERFACE: eccentric_lobe=(2.0,0,lobe_z_start + lobe_thickness/2) dir=(0,0,1) type=shaft d=25.0
+# INTERFACE: input_shaft=(0,0,0) dir=(0,0,-1) type=shaft d=12.0
 ```
 
 

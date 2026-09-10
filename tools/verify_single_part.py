@@ -7,7 +7,7 @@ Evaluates 6 Pillars of Mechanical Verification across 3 Manufacturing Processes:
 """
 
 import math
-from typing import Any, List, Optional, Literal
+from typing import Any, List, Optional, Literal, Dict
 import cadquery as cq
 from orchestrator.models import DFMDiagnostic, VerificationVerdict
 from orchestrator.toolbox import AgentToolbox
@@ -208,7 +208,9 @@ def check_bounding_box_compliance(
     target_width: Optional[float] = None,
     target_height: Optional[float] = None,
     tolerance: float = 2.0,
-    is_gear: bool = False
+    is_gear: bool = False,
+    explicit_constraints: Optional[Dict[str, float]] = None,
+    is_single_part: bool = False
 ) -> DFMDiagnostic:
     """SPEC-01: Verifies that generated bounding box matches spec targets across all 3 axes within tolerance."""
     shape_obj = _get_shape_obj(val_shape)
@@ -227,10 +229,41 @@ def check_bounding_box_compliance(
                 message=f"No bounding box targets specified ({measured_dims})."
             )
 
+        has_explicit = bool(explicit_constraints)
+
+        # 1. Unconstrained standalone part: user specified no dimensions in prompt.
+        # The Planner's numbers were purely arbitrary guesses. Any physically sane scale (0.5mm - 1000mm) passes!
+        if is_single_part and not has_explicit:
+            if any(m > 2000.0 or m < 0.5 for m in measured_dims):
+                return DFMDiagnostic(
+                    rule_id="SPEC-01",
+                    status="FAIL",
+                    parameter="bounding_box_compliance",
+                    measured=round(max(measured_dims), 2),
+                    required=500.0,
+                    message=f"Part scale {measured_dims}mm is outside realistic mechanical envelope (0.5mm - 2000mm)."
+                )
+            return DFMDiagnostic(
+                rule_id="SPEC-01",
+                status="PASS",
+                parameter="bounding_box_compliance",
+                measured=round(max(measured_dims), 2),
+                required=round(max(target_dims), 2),
+                message=f"Unconstrained part dimensions {measured_dims}mm comply with general mechanical scale."
+            )
+
+        # 2. Constrained parts or multi-part assemblies: check against target dimensions
         pairs_to_check = list(zip(measured_dims[-len(target_dims):], target_dims))
         failures = []
         for m_val, t_val in pairs_to_check:
-            effective_tol = max(tolerance, t_val * 0.25, 25.0) if is_gear else max(tolerance, t_val * 0.20, 5.0)
+            if has_explicit:
+                # User gave explicit dimensional numbers in prompt: strict compliance
+                effective_tol = max(tolerance, t_val * 0.15, 3.0)
+            elif is_gear:
+                effective_tol = max(tolerance, t_val * 0.25, 25.0)
+            else:
+                effective_tol = max(tolerance, t_val * 0.35, 15.0)
+
             diff = abs(m_val - t_val)
             if diff > effective_tol:
                 failures.append(f"dimension {m_val}mm deviates from target {t_val}mm (diff: {round(diff, 2)}mm > {round(effective_tol, 1)}mm tol)")
@@ -348,12 +381,37 @@ def check_dfm_wall_thickness(val_shape: Any, min_thickness: float = 1.5) -> DFMD
             if not _is_internal_cylinder(cyl):
                 continue  # Solid shaft/boss, skip
 
-            hole_edge_centers = [e.Center() for e in cyl.edges()] if hasattr(cyl, "edges") else []
+            # Determine cylinder axis
+            try:
+                from OCP.BRepAdaptor import BRepAdaptor_Surface
+                from OCP.GeomAbs import GeomAbs_Cylinder
+                surf = BRepAdaptor_Surface(cyl.wrapped)
+                if surf.GetType() == GeomAbs_Cylinder:
+                    c_axis = surf.Cylinder().Axis().Direction()
+                    axis_dir = cq.Vector(c_axis.X(), c_axis.Y(), c_axis.Z())
+                else:
+                    axis_dir = cq.Vector(0, 0, 1)
+            except Exception:
+                axis_dir = cq.Vector(0, 0, 1)
+
+            cyl_edges = cyl.edges() if hasattr(cyl, "edges") else []
+            hole_edge_centers = [e.Center() for e in cyl_edges]
+
+            # Check planar boundary walls
             for of in wp.faces("%PLANE").vals():
                 if not hasattr(of, "edges"):
                     continue
-                shares_opening = any(
-                    any((e.Center() - hc).Length < 1e-3 for e in of.edges())
+                try:
+                    n = of.normalAt()
+                    if abs(n.dot(axis_dir)) > 0.75:
+                        continue  # Endcap, step, or counterbore face perpendicular to axis, skip
+                except Exception:
+                    pass
+
+                of_edges = of.edges()
+                shares_edge = any(e1.isSame(e2) for e1 in cyl_edges for e2 in of_edges)
+                shares_opening = shares_edge or any(
+                    any((e.Center() - hc).Length < 1e-2 for e in of_edges)
                     for hc in hole_edge_centers
                 )
                 if not shares_opening and hasattr(cyl, "wrapped") and hasattr(of, "wrapped"):
@@ -361,17 +419,32 @@ def check_dfm_wall_thickness(val_shape: Any, min_thickness: float = 1.5) -> DFMD
                     extrema = BRepExtrema_DistShapeShape(cyl.wrapped, of.wrapped)
                     if extrema.IsDone() and extrema.NbSolution() > 0:
                         d = extrema.Value()
-                        if d < min_hole_wall:
+                        # If d < 1e-3, they touch topologically (adjacent face/opening), skip
+                        if 1e-3 < d < min_hole_wall:
                             min_hole_wall = d
 
-        if min_hole_wall < min_thickness:
+            # Check distance to other cylinders (hole-to-hole or hole-to-outer-casing)
+            for oc in cylinders:
+                if oc.isSame(cyl):
+                    continue
+                if hasattr(cyl, "wrapped") and hasattr(oc, "wrapped"):
+                    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+                    extrema = BRepExtrema_DistShapeShape(cyl.wrapped, oc.wrapped)
+                    if extrema.IsDone() and extrema.NbSolution() > 0:
+                        d = extrema.Value()
+                        if 1e-3 < d < min_hole_wall:
+                            min_hole_wall = d
+
+        # Standard ISO/DIN DFM hole-to-edge clearance is 1.5mm to 2.0mm
+        req_hole_wall = min(min_thickness, 2.0)
+        if min_hole_wall < req_hole_wall:
             return DFMDiagnostic(
                 rule_id="STRUCT-01",
                 status="FAIL",
                 parameter="min_wall_thickness",
                 measured=round(min_hole_wall, 2),
-                required=min_thickness,
-                message=f"Hole wall thickness to outer edge ({round(min_hole_wall, 2)}mm) is less than required {min_thickness}mm."
+                required=req_hole_wall,
+                message=f"Hole wall thickness to outer edge ({round(min_hole_wall, 2)}mm) is less than required {req_hole_wall}mm."
             )
 
         effective_wall = min(min_dim, min_hole_wall) if min_hole_wall != float("inf") else min_dim
@@ -719,6 +792,8 @@ def verify_single_part(
     target_height: Optional[float] = None,
     is_gear: bool = False,
     requires_hole: bool = False,
+    explicit_constraints: Optional[Dict[str, float]] = None,
+    is_single_part: bool = False,
     pillar_filter: Optional[List[str]] = None
 ) -> VerificationVerdict:
     """
@@ -736,7 +811,7 @@ def verify_single_part(
         rule_map = {
             "PHYS-01": lambda: check_solid_manifold(val_shape),
             "PHYS-02": lambda: check_brep_topology_integrity(val_shape),
-            "SPEC-01": lambda: check_bounding_box_compliance(val_shape, target_len, target_width, target_height, tolerance=20.0 if depth == "concept" else 2.0, is_gear=is_gear),
+            "SPEC-01": lambda: check_bounding_box_compliance(val_shape, target_len, target_width, target_height, tolerance=20.0 if depth == "concept" else 2.0, is_gear=is_gear, explicit_constraints=explicit_constraints, is_single_part=is_single_part),
             "FEAT-01": lambda: check_feature_count(val_shape, requires_hole=requires_hole),
             "STRUCT-01": lambda: check_dfm_wall_thickness(val_shape, min_thickness=min_wall),
             "STRUCT-02": lambda: check_slenderness_ratio(val_shape, max_ratio=max_slender),
@@ -756,13 +831,13 @@ def verify_single_part(
         if depth == "concept":
             diagnostics.append(check_solid_manifold(val_shape))
             diagnostics.append(check_brep_topology_integrity(val_shape))
-            diagnostics.append(check_bounding_box_compliance(val_shape, target_len, target_width, target_height, tolerance=20.0, is_gear=is_gear))
+            diagnostics.append(check_bounding_box_compliance(val_shape, target_len, target_width, target_height, tolerance=20.0, is_gear=is_gear, explicit_constraints=explicit_constraints, is_single_part=is_single_part))
 
         # 2. Functional Depth (Pillars 1, 2, 3, 4)
         elif depth == "functional":
             diagnostics.append(check_solid_manifold(val_shape))
             diagnostics.append(check_brep_topology_integrity(val_shape))
-            diagnostics.append(check_bounding_box_compliance(val_shape, target_len, target_width, target_height, tolerance=2.0, is_gear=is_gear))
+            diagnostics.append(check_bounding_box_compliance(val_shape, target_len, target_width, target_height, tolerance=2.0, is_gear=is_gear, explicit_constraints=explicit_constraints, is_single_part=is_single_part))
             diagnostics.append(check_feature_count(val_shape, requires_hole=requires_hole))
             diagnostics.append(check_dfm_wall_thickness(val_shape, min_thickness=min_wall))
             diagnostics.append(check_slenderness_ratio(val_shape, max_ratio=max_slender))
@@ -771,7 +846,7 @@ def verify_single_part(
         elif depth == "manufacturing":
             diagnostics.append(check_solid_manifold(val_shape))
             diagnostics.append(check_brep_topology_integrity(val_shape))
-            diagnostics.append(check_bounding_box_compliance(val_shape, target_len, target_width, target_height, tolerance=2.0, is_gear=is_gear))
+            diagnostics.append(check_bounding_box_compliance(val_shape, target_len, target_width, target_height, tolerance=2.0, is_gear=is_gear, explicit_constraints=explicit_constraints, is_single_part=is_single_part))
             diagnostics.append(check_feature_count(val_shape, requires_hole=requires_hole))
             diagnostics.append(check_dfm_wall_thickness(val_shape, min_thickness=min_wall))
             diagnostics.append(check_slenderness_ratio(val_shape, max_ratio=max_slender))
@@ -791,7 +866,7 @@ def verify_single_part(
         elif depth == "assembly_ready":
             diagnostics.append(check_solid_manifold(val_shape))
             diagnostics.append(check_brep_topology_integrity(val_shape))
-            diagnostics.append(check_bounding_box_compliance(val_shape, target_len, target_width, target_height, tolerance=2.0, is_gear=is_gear))
+            diagnostics.append(check_bounding_box_compliance(val_shape, target_len, target_width, target_height, tolerance=2.0, is_gear=is_gear, explicit_constraints=explicit_constraints, is_single_part=is_single_part))
             diagnostics.append(check_feature_count(val_shape, requires_hole=requires_hole))
             diagnostics.append(check_dfm_wall_thickness(val_shape, min_thickness=min_wall))
             diagnostics.append(check_slenderness_ratio(val_shape, max_ratio=max_slender))

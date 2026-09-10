@@ -39,6 +39,10 @@ class CodeGeneratorAgent:
         if fits_skill.exists():
             content += fits_skill.read_text() + "\n\n"
 
+        joints_skill = Path("skills/kinematic_joints/SKILL.md")
+        if joints_skill.exists():
+            content += joints_skill.read_text() + "\n\n"
+
         if is_compliant and compliant_skill.exists():
             content += compliant_skill.read_text()
             
@@ -89,6 +93,10 @@ class CodeGeneratorAgent:
             "   - Refer to the attached PROCESS & MODELING SKILLS for exact mathematical formulas, standard part construction patterns, and safe modeling idioms for gears, brackets, fasteners, carriers, housings, and compliant mechanisms.\n"
             "   - Adhere strictly to the manufacturing constraints for the specified process (e.g. minimum wall thickness, minimum hole diameters, tool access).\n"
             "6. Safe Selectors: Never use English words ('and', 'or') inside string selectors. NEVER use indexed N-th selectors like `>Z[-2]` or `faces('>Z[1]')` (causes 'ValueError: Can not return the Nth element of an empty list'). NEVER call `.filterBy(...)` (CadQuery Workplane has NO filterBy method — use standard selectors like `.faces('>Z').edges('%CIRCLE')`). NEVER pass a Workplane to `.placeSketch()`.\n"
+            "6b. Workplane & Thread Safety:\n"
+            "   - NO HELIX: CadQuery Workplane has NO `.helix()` method! NEVER call `.helix()` on a Workplane (AttributeError). Fasteners must be modeled as a nominal cylinder diameter with standard lead-in chamfer at `<Z` or cosmetic annular grooves.\n"
+            "   - Workplane CenterOption: When creating a workplane on a face of a solid (e.g. `faces('>Z').workplane(...)` or `faces('>X').workplane(...)`), CadQuery by default re-projects the previous plane origin, causing holes to drill along outer edges/corners. ALWAYS specify `centerOption='CenterOfMass'` (e.g. `.faces('>X').workplane(centerOption='CenterOfMass').hole(...)`) so features are centered on that face!\n"
+            "   - Through Holes on Cubes/Blocks: Calling `.hole(d)` cuts through the entire solid. Drilling `>Z` penetrates both +Z and -Z. Do NOT duplicate drill `<Z`.\n"
             "7. Shared Parameters: If SHARED ASSEMBLY PARAMETERS are provided, inherit those exact dimensions (center distances, matching shaft/bore diameters, clearances) so your part interfaces seamlessly with partner parts.\n"
             "8. Output Format:\n"
             "   - When generating from scratch (no PREVIOUS CODE DRAFT): Output complete executable Python code enclosed in ```python ... ``` fences.\n"
@@ -156,7 +164,16 @@ class CodeGeneratorAgent:
                 print(f"  ⚡ [DesignerAgent] Applied targeted SEARCH/REPLACE edit without full script regeneration.")
                 cleaned_code = patched_code
             else:
-                cleaned_code = self._clean_fences(code_text)
+                # If surgical diff failed to apply, never send raw diff markers to python exec!
+                rep_matches = re.findall(r"=======\s*\n(.*?)\n>>>>>>>", code_text, re.DOTALL)
+                if rep_matches and "result =" in rep_matches[0]:
+                    cleaned_code = rep_matches[0].strip()
+                else:
+                    cleaned_code = self._clean_fences(code_text)
+                if "<<<<<<< SEARCH" in cleaned_code:
+                    cleaned_code = re.sub(r"<<<<<<< SEARCH.*?>>>>>>>", "", cleaned_code, flags=re.DOTALL).strip()
+                    if not cleaned_code or "result" not in cleaned_code:
+                        cleaned_code = previous_code
         else:
             cleaned_code = self._clean_fences(code_text)
 
@@ -164,14 +181,32 @@ class CodeGeneratorAgent:
 
         return DesignerOutput(
             part_id=spec.id,
-            code=cleaned_code,
+            code=self._normalize_cadquery_code(cleaned_code),
             interfaces=interfaces
         )
 
     @staticmethod
+    def _normalize_cadquery_code(code: str) -> str:
+        """
+        Normalizes CadQuery code to prevent common CadQuery pitfalls:
+        1. When chaining .faces(...).workplane() without centerOption, default to 'CenterOfMass'
+           so features/holes are centered on the selected face rather than projected onto edge seams.
+        """
+        if not code:
+            return code
+        # Default .faces(...).workplane() to centerOption="CenterOfMass"
+        pattern = r"(\.faces\s*\([^)]+\)\s*\.workplane)\s*\(\s*\)"
+        code = re.sub(pattern, r'\1(centerOption="CenterOfMass")', code)
+        return code
+
+    @staticmethod
     def _clean_fences(code_text: str) -> str:
-        """Safely cleans markdown code block fences."""
+        """Safely cleans markdown code block fences and extracts python code."""
         cleaned = code_text.strip()
+        # If there is a ```python ... ``` block in the response, extract it!
+        match = re.search(r"```(?:python)?\s*\n(.*?)\n```", cleaned, re.DOTALL | re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
         if cleaned.startswith("```"):
             first_newline = cleaned.find("\n")
             if first_newline != -1:
@@ -198,23 +233,35 @@ class CodeGeneratorAgent:
         if not matches:
             return previous_code, False
 
-        modified = previous_code
+        modified = previous_code.replace("\r\n", "\n")
         applied_count = 0
         for match in matches:
-            search_block = match.group(1)
-            replace_block = match.group(2)
+            search_block = match.group(1).strip("\r\n")
+            replace_block = match.group(2).strip("\r\n")
             if search_block in modified:
                 modified = modified.replace(search_block, replace_block, 1)
                 applied_count += 1
+            elif search_block.strip() in modified:
+                # Strip leading/trailing whitespace match
+                s_strip = search_block.strip()
+                idx = modified.find(s_strip)
+                if idx != -1:
+                    modified = modified[:idx] + replace_block + modified[idx + len(s_strip):]
+                    applied_count += 1
             else:
                 # Line-by-line whitespace-trimmed fallback
-                search_lines = [l.strip() for l in search_block.splitlines() if l.strip()]
+                search_lines = [l.strip() for l in search_block.splitlines()]
+                while search_lines and not search_lines[0]:
+                    search_lines.pop(0)
+                while search_lines and not search_lines[-1]:
+                    search_lines.pop()
                 if search_lines:
                     mod_lines = modified.splitlines()
-                    for i in range(len(mod_lines) - len(search_lines) + 1):
-                        window = [mod_lines[i + j].strip() for j in range(len(search_lines))]
+                    n_search = len(search_lines)
+                    for i in range(len(mod_lines) - n_search + 1):
+                        window = [mod_lines[i + k].strip() for k in range(n_search)]
                         if window == search_lines:
-                            new_lines = mod_lines[:i] + replace_block.splitlines() + mod_lines[i + len(search_lines):]
+                            new_lines = mod_lines[:i] + replace_block.splitlines() + mod_lines[i + n_search:]
                             modified = "\n".join(new_lines)
                             applied_count += 1
                             break

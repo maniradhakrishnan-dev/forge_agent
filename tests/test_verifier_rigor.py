@@ -133,3 +133,38 @@ def test_part_repair_agent_user_parametric_edit():
     assert fixed2 is True
     assert "length = 55.0" in new_code2
     assert "hole_dia = 4.0" in new_code2
+
+
+def test_spec_01_unconstrained_single_part_flexibility():
+    """Unconstrained single parts (no explicit user constraints) tolerate natural proportional variations."""
+    shape = cq.Workplane("XY").box(100.0, 50.0, 50.0)
+    
+    # 1. With is_single_part=True and no explicit constraints: 100x50x50 passes against inferred 50x50x50
+    diag_pass = check_bounding_box_compliance(
+        shape, target_len=50.0, target_width=50.0, target_height=50.0,
+        is_single_part=True, explicit_constraints={}
+    )
+    assert diag_pass.status == "PASS"
+
+    # 2. With explicit user constraints (user asked for length=50): 100x50x50 strictly fails
+    diag_fail = check_bounding_box_compliance(
+        shape, target_len=50.0, target_width=50.0, target_height=50.0,
+        is_single_part=True, explicit_constraints={"length": 50.0}
+    )
+    assert diag_fail.status == "FAIL"
+
+
+def test_part_repair_fillet_crash_healing():
+    """PartRepairAgent heals OpenCascade ChFi3d_Builder and empty edge selection crashes."""
+    code = (
+        "import cadquery as cq\n"
+        "result = cq.Workplane('XY').box(20, 20, 10).edges().fillet(2.0)\n"
+    )
+    agent = PartRepairAgent()
+    
+    # Simulate ChFi3d_Builder crash
+    err = "CadQuery Execution Error: Standard_ConstructionError: ChFi3d_Builder:only 2 faces"
+    new_code, fixed, notes = agent.attempt_syntax_fix(code, err)
+    assert fixed is True
+    assert ".fillet(" not in new_code
+    assert "result = cq.Workplane('XY').box(20, 20, 10)" in new_code

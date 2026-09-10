@@ -108,9 +108,30 @@ async def run_part_iteration(
                 return True, spec, verdict, p_code, artifacts
         print(f"  ⚠️  Parametric edit did not satisfy verifier; escalating to Planner & Designer LLMs.")
 
+    # Measure base solid envelope to preserve proportions if prompt doesn't specify dimension changes
+    base_len, base_wid, base_hgt = 40.0, 30.0, 10.0
+    try:
+        base_solid, _ = await execute_cadquery_code(existing_code)
+        if base_solid:
+            bb = base_solid.BoundingBox()
+            base_len, base_wid, base_hgt = max(bb.xlen, 1.0), max(bb.ylen, 1.0), max(bb.zlen, 1.0)
+    except Exception:
+        pass
+
     print(f"\n[Iteration] 🧠 Planning modifications for part from user request: '{prompt}'...")
     t0 = time.time()
     part_spec = await planner.plan_iteration_part(existing_code, prompt)
+    part_spec.is_single_part = True
+
+    # Preserve base part dimensions if planner left default placeholders (40x30) without explicit prompt constraints
+    explicit = getattr(part_spec, "explicit_constraints", {}) or {}
+    if "length" not in explicit and (part_spec.length == 40.0 or part_spec.length <= 0):
+        part_spec.length = round(base_len, 1)
+    if "width" not in explicit and (part_spec.width == 30.0 or part_spec.width <= 0):
+        part_spec.width = round(base_wid, 1)
+    if "height" not in explicit and (part_spec.height == 10.0 or part_spec.height <= 0):
+        part_spec.height = round(base_hgt, 1)
+
     logger.log_step(
         agent="planner_agent",
         part_id=part_spec.id,
@@ -442,3 +463,41 @@ async def run_assembly_iteration(
 
     logger.generate_summary_markdown(f"Iterate Assembly: {prompt}", passed)
     return passed, initial_graph, final_verdict or AssemblyVerdict(passed=False), transformed_solids, part_artifacts
+
+
+async def run_iteration_pipeline(
+    iterate_path: str,
+    user_feedback: str,
+    target_part_id: Optional[str] = None,
+    output_dir: str = "artifacts/iteration",
+    gateway_client: Optional[GatewayClient] = None,
+    run_logger: Optional[RunLogger] = None,
+    run_id: Optional[str] = None
+) -> Tuple[bool, Any, Any, Any, Dict[str, Any]]:
+    """
+    Unified entry point for human-in-the-loop iteration on parts or assemblies.
+    Resolves target type and routes to run_part_iteration or run_assembly_iteration.
+    """
+    target_type, resolved_path, meta = resolve_iteration_target(iterate_path)
+    run_id = run_id or (run_logger.run_id if run_logger else str(uuid.uuid4())[:8])
+    gw = gateway_client or GatewayClient()
+
+    if target_type == "part":
+        return await run_part_iteration(
+            base_code_or_file=resolved_path,
+            prompt=user_feedback,
+            output_dir=output_dir,
+            gateway_client=gw,
+            run_id=run_id
+        )
+    else:
+        passed, graph, verdict, solids, artifacts = await run_assembly_iteration(
+            base_run_dir=resolved_path,
+            prompt=user_feedback,
+            target_part_id=target_part_id,
+            output_dir=output_dir,
+            gateway_client=gw,
+            run_id=run_id
+        )
+        return passed, graph, verdict, "", artifacts
+

@@ -49,15 +49,22 @@ def _find_compatible_ports(
             if p_name.lower() == m_name.lower():
                 score += 80.0
 
+            # Check Radial Pitch Circle Radius Compatibility (e.g. carrier pin PCD/2)
+            import math
+            p_r = math.sqrt(p_port.position[0]**2 + p_port.position[1]**2)
+            m_r = math.sqrt(m_port.position[0]**2 + m_port.position[1]**2)
+            if abs(p_r - m_r) <= 1.5 and p_r > 5.0:
+                score += 80.0  # High bonus for matching pitch circle radius (e.g. PCD = 60mm)
+
             # Check Diameter Compatibility
             if p_port.diameter is not None and m_port.diameter is not None:
                 d_diff = abs(p_port.diameter - m_port.diameter)
                 if d_diff <= 1.0:
                     score += 100.0 - (d_diff * 20.0)  # Up to +100 for matching diameters
-                elif d_diff <= 3.0:
-                    score += 40.0
-                elif d_diff > 10.0:
-                    score -= 100.0  # Heavy penalty for severe diameter mismatch (e.g. 8mm shaft vs 78mm bore)
+                elif d_diff <= 6.0:
+                    score += 50.0  # Normal for cycloidal orbital pin/hole clearances (2*e)
+                elif d_diff > 12.0:
+                    score -= 100.0  # Heavy penalty for severe diameter mismatch
 
             # Match against declared mate diameter
             if mate_d is not None:
@@ -319,9 +326,14 @@ class AssemblyAgent:
                     except Exception:
                         overlap_vol = 0.0
 
+                    is_nested_mechanism = (
+                        any(kw in part_spec.id.lower() or kw in partner_id.lower() for kw in ("disc", "carrier", "shaft", "planet", "sun", "cycloid", "gear", "pinion"))
+                        and (my_port.feature_type in ("hole", "shaft", "pin", "gear_mesh") or target_port.feature_type in ("hole", "shaft", "pin", "gear_mesh"))
+                    )
+
                     vol_p = part_solid.Volume() if hasattr(part_solid, "Volume") else 1.0
-                    # If severe volume collision (> 30% or > 50 mm³) occurs coaxially
-                    if overlap_vol > 50.0 and (overlap_vol / max(1.0, vol_p)) > 0.30:
+                    # If severe volume collision (> 30% or > 50 mm³) occurs coaxially on non-nested parts
+                    if not is_nested_mechanism and overlap_vol > 50.0 and (overlap_vol / max(1.0, vol_p)) > 0.30:
                         bb_partner = partner_solid.BoundingBox()
                         bb_me = part_solid.translate((tx, ty, 0)).BoundingBox()
                         # If target port is at or near top face, stack above partner (+Z)
@@ -449,13 +461,24 @@ class AssemblyAgent:
         for p in graph.parts:
             sub = out_path / p.id
             if sub.is_dir():
-                py_files = list(sub.glob("*.py"))
-                if py_files:
-                    part_files[p.id] = f"{p.id}/{py_files[0].name}"
+                exact_match = sub / f"{p.id}.py"
+                if exact_match.is_file():
+                    part_files[p.id] = f"{p.id}/{p.id}.py"
                     continue
-            root_pys = list(out_path.glob(f"{p.id}*.py"))
+                valid_pys = [f for f in sub.glob("*.py") if not f.name.startswith("failed_")]
+                if valid_pys:
+                    # Pick most recent non-failed script
+                    best_f = max(valid_pys, key=lambda f: f.stat().st_mtime)
+                    part_files[p.id] = f"{p.id}/{best_f.name}"
+                    continue
+            exact_root = out_path / f"{p.id}.py"
+            if exact_root.is_file():
+                part_files[p.id] = f"{p.id}.py"
+                continue
+            root_pys = [f for f in out_path.glob(f"{p.id}*.py") if not f.name.startswith("failed_") and not f.name.endswith("_assembly.py")]
             if root_pys:
-                part_files[p.id] = root_pys[0].name
+                best_rf = max(root_pys, key=lambda f: f.stat().st_mtime)
+                part_files[p.id] = best_rf.name
 
         for idx, (pid, rel_path) in enumerate(part_files.items()):
             color_idx = idx % 5

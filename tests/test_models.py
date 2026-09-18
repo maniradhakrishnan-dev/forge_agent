@@ -88,3 +88,42 @@ def test_repair_instruction():
     )
     assert repair.target_agent == "code_generator_agent"
     assert repair.fault_type == "dfm"
+
+
+def test_part_spec_json_roundtrip(tmp_path):
+    spec = PartSpec(
+        id="block_1",
+        name="block",
+        length=40.0,
+        width=40.0,
+        height=10.0,
+        hole_diameter=10.0,
+        custom_parameters={"counterbore_dia": 14.0},
+        features=[{"type": "hole", "diameter": 10.0, "position": [0, 0, 0]}]
+    )
+    json_path = tmp_path / "spec.json"
+    written_path = spec.to_json_file(json_path)
+    assert written_path.exists()
+
+    loaded = PartSpec.from_json_file(json_path)
+    assert loaded.id == "block_1"
+    assert loaded.length == 40.0
+    assert loaded.hole_diameter == 10.0
+    assert loaded.custom_parameters["counterbore_dia"] == 14.0
+    assert len(loaded.features) == 1
+    assert loaded.features[0]["diameter"] == 10.0
+
+
+def test_assembly_graph_json_roundtrip(tmp_path):
+    part1 = PartSpec(id="block_1", name="block", length=40.0, width=40.0, height=10.0, hole_diameter=10.0)
+    part2 = PartSpec(id="shaft_1", name="shaft", length=40.0, width=9.85, height=9.85)
+    graph = AssemblyGraph(name="test_assembly", parts=[part1, part2])
+    json_path = tmp_path / "assembly_graph.json"
+    graph.to_json_file(json_path)
+    assert json_path.exists()
+
+    loaded = AssemblyGraph.from_json_file(json_path)
+    assert len(loaded.parts) == 2
+    assert loaded.parts[0].name == "block"
+    assert loaded.parts[1].name == "shaft"
+

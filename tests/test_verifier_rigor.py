@@ -168,3 +168,17 @@ def test_part_repair_fillet_crash_healing():
     assert fixed is True
     assert ".fillet(" not in new_code
     assert "result = cq.Workplane('XY').box(20, 20, 10)" in new_code
+
+
+def test_feat_01_allows_cylindrical_shaft():
+    """A cylindrical shaft has 3 to 5 faces and must PASS FEAT-01 (not require >=6 faces like a box)."""
+    # Simple cylinder with 3 faces (1 tube + 2 caps)
+    shaft = cq.Workplane("XY").circle(5.0).extrude(40.0).val()
+    diag = check_feature_count(shaft, is_shaft=True)
+    assert diag.status == "PASS"
+
+    # Chamfered shaft with 5 faces
+    chamfered_shaft = cq.Workplane("XY").circle(5.0).extrude(40.0).faces("<Z or >Z").chamfer(0.5).val()
+    diag2 = check_feature_count(chamfered_shaft, is_shaft=True)
+    assert diag2.status == "PASS"
+

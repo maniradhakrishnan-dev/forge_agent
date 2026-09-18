@@ -29,10 +29,35 @@ result = (
 )
 ```
 
+### CRITICAL: CadQuery `box()` Centering Behavior & Adding Features on Top
+`cq.Workplane("XY").box(L, W, H)` centers the box at `(0, 0, 0)` by default.
+- Z extends from `-H/2` to `+H/2`.
+- The top face is at `Z = +H/2`, NOT `Z = H`!
+- The bottom face is at `Z = -H/2`, NOT `Z = 0`!
+- **NEVER create features on top of a box using `cq.Workplane("XY").workplane(offset=H)`** — this leaves an empty air gap of `H/2` between the base and features, creating **disconnected solid bodies (PHYS-01 failure)**!
+- **CORRECT Idioms to build features (bosses, lugs, walls) on top of a base:**
+  1. **Direct face selection (Recommended):**
+     ```python
+     result = cq.Workplane("XY").box(BASE_L, BASE_W, BASE_H)
+     # Build lugs or bosses directly on the top face:
+     result = (
+         result.faces(">Z").workplane(centerOption="CenterOfMass")
+         .pushPoints([(0, lug_offset), (0, -lug_offset)])
+         .rect(lug_len, lug_width)
+         .extrude(lug_height)
+     )
+     ```
+  2. **Or start from Z=0 using `centered=(True, True, False)`:**
+     `result = cq.Workplane("XY").box(BASE_L, BASE_W, BASE_H, centered=(True, True, False))` (Z is now 0 to H, so `offset=BASE_H` touches the top face).
+
 ### CRITICAL: CadQuery Workplane Local Coordinate System & Holes
 When selecting a face with `.faces(...)`, CadQuery's default workplane mode is `"ProjectedOrigin"`, which projects the PREVIOUS workplane's origin onto the face.
-- **ALWAYS use `.workplane(centerOption="CenterOfMass")` or `.workplane(centerOption="CenterOfBoundBox")` when placing holes or features on faces!**
-  If you do not specify `centerOption="CenterOfMass"`, moving between faces (e.g. drilling `>Z` then `>X`) causes CadQuery to offset the origin onto the outer edge seam `(50, 0, 50)`, drilling a slot/groove into the corner rather than a centered hole!
+- **For Centered / Symmetric solids (boxes, cylinders, symmetric blocks):**
+  Use `.workplane(centerOption="CenterOfMass")` when placing centered holes or symmetric feature arrays.
+  *(Note: when moving between faces like `>Z` then `>X`, without `CenterOfMass` CadQuery may offset the origin to the outer edge seam.)*
+- **For Origin-Referenced or Asymmetric parts (L-brackets, bell-cranks, rocker arms where `(0, 0)` is the pivot/datum):**
+  **DO NOT use `CenterOfMass`** — on an L-shape, lever, or offset arm, the center of mass is shifted diagonally (e.g. at (11.4, 11.4)), causing `.moveTo(0, 0)` to drill into empty air outside the part!
+  Instead, use `centerOption="ProjectedOrigin"` (the default of `.workplane()`), which preserves the exact `(0, 0)` world datum on the face!
 - **Holes Through a 3D Solid / Cube:**
   Calling `.hole(diameter)` cuts through the entire solid. E.g. drilling on `>Z` penetrates both +Z and -Z faces.
   Canonical pattern for a perforated cube (e.g. 100x100x100mm cube with centered holes on each face):
@@ -64,6 +89,84 @@ When selecting a face with `.faces(...)`, CadQuery's default workplane mode is `
   result = result.faces("<X").workplane(centerOption="CenterOfBoundBox").hole(hole_dia)
   ```
   *(Note: NEVER use `.extrude(width, both=True)` without halving width — `both=True` extrudes `width` in both directions, making total length $2 \times \text{width}$!)*
+
+- **Clevis Brackets, Forks & U-Lugs (Slot-Cut or Extruded U-Profile Idiom):**
+  When modeling a clevis bracket with a base plate and two parallel upright lugs spaced by `gap`:
+  **DO NOT** create a wide base and union separate thin lugs with manual offsets — `faces(">X")` will select the outer base ends instead of the lugs, drilling the pivot hole into the base plate instead of through the lugs!
+  
+  **Canonical Pattern: Subtractive Slot-Cut (Recommended):**
+  ```python
+  # 1. Solid envelope: base length, width, total height (base thickness + lug height)
+  result = cq.Workplane("XY").box(BASE_L, BASE_W, BASE_H + LUG_H, centered=(True, True, False))
+  
+  # 2. Cut central slot between the two upright lugs:
+  result = (
+      result.faces(">Z").workplane()
+      .rect(LUG_GAP, BASE_W + 1.0)
+      .cutBlind(-LUG_H)
+  )
+  
+  # 3. Drill pivot pin hole through both upright lugs (faces('>X') is now the outer lug face!):
+  result = (
+      result.faces(">X").workplane(centerOption="CenterOfMass")
+      .transformed(offset=(0, 0, LUG_H / 2))
+      .hole(PIVOT_BORE_D)
+  )
+  
+  # 4. Mounting holes in base plate:
+  result = (
+      result.faces("<Z").workplane(centerOption="CenterOfMass")
+      .pushPoints([(-20, 0), (20, 0)])
+      .hole(MOUNT_HOLE_D)
+  )
+  ```
+
+- **Bell-Cranks, Rocker Arms & Linkage Levers (Center Pivot Idiom):**
+  When modeling a bell-crank, rocker arm, or lever with a central pivot and extending arms:
+  **ALWAYS place the central pivot hub at `(0, 0)`** so the pivot bore and interface port align at `(0, 0)`.
+  ```python
+  # 1. Central pivot hub with boss:
+  pivot_hub = cq.Workplane("XY").circle(PIVOT_HUB_R).extrude(THICKNESS)
+  
+  # 2. Arm 1 extending to (L1, 0) with end boss:
+  arm1 = cq.Workplane("XY").polyline([
+      (0, -ARM_W/2), (L1, -ARM_W/2), (L1, ARM_W/2), (0, ARM_W/2)
+  ]).close().extrude(THICKNESS)
+  boss1 = cq.Workplane("XY").transformed(offset=(L1, 0, 0)).circle(END_BOSS_R).extrude(THICKNESS)
+  
+  # 3. Arm 2 extending to (0, L2) with end boss:
+  arm2 = cq.Workplane("XY").polyline([
+      (-ARM_W/2, 0), (-ARM_W/2, L2), (ARM_W/2, L2), (ARM_W/2, 0)
+  ]).close().extrude(THICKNESS)
+  boss2 = cq.Workplane("XY").transformed(offset=(0, L2, 0)).circle(END_BOSS_R).extrude(THICKNESS)
+  
+  # 4. Fuse body and drill all holes (use ProjectedOrigin to keep (0,0) at central pivot!):
+  result = pivot_hub.union(arm1).union(boss1).union(arm2).union(boss2)
+  result = (
+      result.faces(">Z").workplane(centerOption="ProjectedOrigin")
+      .hole(PIVOT_BORE_D) # Central pivot at (0, 0)
+      .pushPoints([(L1, 0), (0, L2)])
+      .hole(LINKAGE_PIN_D) # Linkage pin holes at (L1, 0) and (0, L2)
+  )
+  # INTERFACE: central_pivot=(0,0,0) dir=(0,0,1) type=hole d=PIVOT_BORE_D
+  # INTERFACE: linkage_pin_1=(L1,0,0) dir=(0,0,1) type=hole d=LINKAGE_PIN_D
+  # INTERFACE: linkage_pin_2=(0,L2,0) dir=(0,0,1) type=hole d=LINKAGE_PIN_D
+  ```
+
+- **Yokes, Slider Frames & Guide Rods (Frame Enclosure Idiom):**
+  When modeling a yoke, slider frame, or scotch-yoke with an internal window and an extending guide rod:
+  1. **Enclosure Size Sanity:** The outer frame width and length MUST be larger than the internal window to leave positive structural wall thickness ($W_{outer} > W_{window}$ and $L_{outer} > L_{window}$). If the outer frame is smaller than the window, cutting the window severs the frame!
+  2. **Guide Rod Location:** An extending guide rod, plunger, or stem attaches to the **end face** of the frame (e.g. `faces(">X")`), NOT on the top face `>Z` where it would float over the empty window hole!
+  ```python
+  # 1. Outer frame (ensure outer width > window width!)
+  result = cq.Workplane("XY").box(FRAME_L, FRAME_W, THICKNESS)
+  # 2. Cut internal window through all:
+  result = result.faces(">Z").workplane().rect(WIN_L, WIN_W).cutThruAll()
+  # 3. Guide rod extending from the end face (>X):
+  result = result.faces(">X").workplane(centerOption="CenterOfMass").circle(ROD_D / 2.0).extrude(ROD_L)
+  # INTERFACE: guide_rod=(FRAME_L/2 + ROD_L, 0, 0) dir=(1,0,0) type=shaft d=ROD_D
+  # INTERFACE: yoke_window=(0, 0, 0) dir=(0,0,1) type=face
+  ```
 
 - **Bolts, Screws & Threaded Fasteners (Monolithic Single-Part Idiom):**
   A bolt or screw is always modeled as ONE single part with the head and shank unioned:
@@ -98,15 +201,55 @@ When selecting a face with `.faces(...)`, CadQuery's default workplane mode is `
   ```
   *(CRITICAL: On a `Workplane("XZ")`, calling `.revolve()` with default arguments rotates around the global Z axis. NEVER pass `axisEnd=(0, 0, 1)` because `(0, 0, 1)` is the workplane normal, which rotates the sketch in-plane and creates a 0-volume sheet!)*
 
+- **Flat Blades, Wings, Fins & Slender Parts (Box + Chamfer Idiom):**
+  Fan blades, propeller wings, fins, and flat slender parts must be modeled using `.box()` or `.extrude()`, **NEVER** using `.loft()` or `.sweep()`. Loft/sweep operations frequently crash with `ValueError: Nothing to loft` because CadQuery requires multiple sketch sections on different workplanes.
+  ```python
+  length = 400.0    # blade span (X)
+  width = 50.0      # chord (Y)
+  thickness = 5.0   # blade thickness (Z)
+
+  # Simple flat blade: box with optional leading/trailing edge chamfers
+  result = cq.Workplane("XY").box(length, width, thickness)
+
+  # Optional: taper the tip by chamfering the far-X edges
+  # result = result.faces(">X").edges("|Y").chamfer(thickness * 0.4)
+
+  # Mounting boss at root end (attach to motor hub)
+  boss_dia = 10.0
+  boss_height = 5.0
+  boss = cq.Workplane("XY").transformed(offset=(-length/2 + boss_dia/2, 0, thickness/2)).circle(boss_dia/2).extrude(boss_height)
+  result = result.union(boss)
+  # INTERFACE: root_mount=(-length/2, 0, 0) dir=(-1,0,0) type=shaft d=boss_dia
+  ```
+  **NEVER use `.loft()` for simple blades!** Loft is only safe when you have exactly 2+ sketches placed on distinct parallel workplanes. For slender flat geometry, always use `.box()` + optional `.chamfer()`.
+
 - **Attached Features & Rings (Union Overlap Idiom):**
   When adding external rings, collars, handles, lugs, or bosses to an existing body using `.union(feature)`:
   The added feature MUST physically embed/overlap into the parent body (embed by $\ge 0.5\text{mm}$).
   For example, for a ring or collar around a tapered vessel/cylinder with outer radius $R(z)$ at height $z$:
   - The ring's inner radius MUST be slightly smaller than the outer radius of the parent wall (e.g. $R_{\text{inner}} = R(z) - 1.0\text{mm}$).
   - The ring's outer radius MUST be larger (e.g. $R_{\text{outer}} = R(z) + 10.0\text{mm}$).
-  - If $R_{\text{inner}} \ge R(z)$, the ring floats in midair with a gap, producing 2 disconnected solid bodies and failing manifold verification (`PHYS-01`).
+- **Pockets, Cavities, and Blind Cuts (Pocket Cut Idiom):**
+  When creating a cavity, pocket, or blind recess in a solid block, ALWAYS chain the cut on the solid using `.faces(">Z").workplane(centerOption="CenterOfMass").rect(pocket_l, pocket_w).cutBlind(-pocket_depth)`:
+  ```python
+  # Base solid
+  result = cq.Workplane("XY").box(outer_l, outer_w, outer_h)
+  # Cut centered cavity
+  result = (
+      result.faces(">Z")
+      .workplane(centerOption="CenterOfMass")
+      .rect(cavity_l, cavity_w)
+      .cutBlind(-cavity_d)
+  )
+  # INTERFACE: cavity_floor=(0, 0, (outer_h/2.0) - cavity_d) dir=(0, 0, 1) type=face
+  ```
+  **CRITICAL RULES FOR POCKETS & CUTS:**
+  1. **NEVER call `.edges().fillet()` on a 2D sketch!** Calling `.rect(...).edges("|Z").fillet(...)` raises `ValueError: Fillets requires that edges be selected` because a 2D sketch has no vertical edges. Fillets apply ONLY to 3D solid edges AFTER `.cutBlind()` or `.extrude()`.
+  2. **Do NOT add corner fillets to internal cuts unless explicitly requested in the prompt or spec.** If the user asks for a 50x50x5 cut and a 50x50x5 block to fit in it, adding fillets to the cut corners causes physical collision/interference with the sharp-cornered insert block!
+  3. **Cavity Floor Interface Coordinate:** For a box centered at Z=0 (extending from $-H/2$ to $+H/2$), the top face is at $+H/2$. A blind cut of depth $D$ places the cavity floor at $Z = +H/2 - D$.
 
 ## 3. Key CadQuery Operations
+
 - **Box:** `cq.Workplane("XY").box(length_x, width_y, height_z)`
 - **Cylinder:** `cq.Workplane("XY").cylinder(height, radius)`
 - **Hole:** `.hole(diameter)` or `.cboreHole(diameter, cboreDiameter, cboreDepth)`
@@ -446,5 +589,104 @@ result = shaft.union(lobe)
 # INTERFACE: eccentric_lobe=(2.0,0,lobe_z_start + lobe_thickness/2) dir=(0,0,1) type=shaft d=25.0
 # INTERFACE: input_shaft=(0,0,0) dir=(0,0,-1) type=shaft d=12.0
 ```
+
+## 11. Hinge Knuckles & Interleaved Barrel Hinges (Piano / Butt Hinges)
+When creating interleaved hinge knuckles for boxes, enclosures, doors, or folding linkages:
+- **Hinge Axis Orientation:** The hinge pin axis runs parallel to the hinge edge (e.g. parallel to Y if along the width edge, or parallel to X if along the length edge).
+- **Knuckle Sizing & Minimum Wall:** Knuckle outer diameter MUST satisfy $OD \ge d_{\text{pin\_hole}} + 2 \times t_{\text{min\_wall}}$. For a $3.2\text{mm}$ bore in 3D printing (min wall $2.0\text{mm}$), $OD \ge 3.2 + 4.0 = 7.2\text{mm}$ (use $8.0\text{mm}$ or $10.0\text{mm}$). NEVER use an OD $< 7.2\text{mm}$ for a $3.2\text{mm}$ pin hole!
+- **Knuckle Center Placement:** Place the knuckle center $(c_x, c_z)$ tangent to the outer box wall (e.g. $c_x = -L/2 - OD/2$, $c_z = H/2$ at the top seam) with solid connecting leaf tabs to the wall.
+- **Robust Construction Sequence:**
+  1. Extrude knuckles as solid cylinders along the hinge axis.
+  2. Union solid leaf tabs connecting the box wall to the knuckle cylinders.
+  3. Drill the continuous pin bore straight through ALL knuckles in one clean cut using `.cut()` along the axis. This guarantees zero interference and perfect coaxial alignment!
+- **Interleaving Pattern:**
+  If base has $N=2$ knuckles of width $W_k$ at $Y = [-20, 0]$, the matching lid has interleaved knuckles at $Y = [-10, 10]$!
+- **Pin:**
+  Model the pin as a simple cylinder of nominal diameter ($3.0\text{mm}$), extruded along the hinge axis to span all 4 knuckles plus retention overhang (e.g. $40\text{mm} + 4\text{mm} = 44\text{mm}$).
+- **Interface Ports:** Coaxial ports with matching direction vectors:
+  `# INTERFACE: hinge_knuckle_bore=(cx, 0.0, cz) dir=(0, 1, 0) type=hole d=3.2`
+  `# INTERFACE: pin_surface=(cx, 0.0, cz) dir=(0, 1, 0) type=shaft d=3.0`
+
+```python
+import cadquery as cq
+
+# Base box 120 x 80 x 40 with hinge knuckles along 80mm edge (Y-axis)
+length = 120.0
+width = 80.0
+height = 40.0
+wall_thickness = 3.0
+knuckle_width = 10.0
+knuckle_od = 8.0
+pin_hole_dia = 3.2
+
+# 1. Base hollow shell
+box = cq.Workplane("XY").box(length, width, height, centered=(True, True, True)).faces(">Z").shell(-wall_thickness)
+
+# 2. Hinge axis along Y at top edge of back wall (X = -length/2)
+cx = -length / 2.0 - knuckle_od / 2.0
+cz = height / 2.0  # Top edge
+
+# Solid connecting tabs (full knuckle_od height to guarantee >= 2mm wall around bore) and knuckle cylinders
+tab1 = cq.Workplane("XY").workplane(offset=cz - knuckle_od / 2.0).transformed(offset=(cx + knuckle_od / 4.0, -15.0, 0)).box(knuckle_od / 2.0, knuckle_width, knuckle_od, centered=(True, True, False))
+tab2 = cq.Workplane("XY").workplane(offset=cz - knuckle_od / 2.0).transformed(offset=(cx + knuckle_od / 4.0, 5.0, 0)).box(knuckle_od / 2.0, knuckle_width, knuckle_od, centered=(True, True, False))
+
+k1 = cq.Workplane("XZ").workplane(offset=-20.0).transformed(offset=(cx, cz)).circle(knuckle_od / 2.0).extrude(knuckle_width)
+k2 = cq.Workplane("XZ").workplane(offset=0.0).transformed(offset=(cx, cz)).circle(knuckle_od / 2.0).extrude(knuckle_width)
+
+result = box.union(tab1).union(tab2).union(k1).union(k2)
+
+# 3. Continuous pin bore through all knuckles
+bore = cq.Workplane("XZ").workplane(offset=-50.0).transformed(offset=(cx, cz)).circle(pin_hole_dia / 2.0).extrude(100.0)
+result = result.cut(bore)
+
+# INTERFACE: hinge_knuckle_bore=(cx, 0.0, cz) dir=(0, 1, 0) type=hole d=3.2
+```
+
+## 12. Storage Box & Matching Fitted Lid with Rim Lip
+When modeling a matching lid for an open-top box:
+- **Overall Lid Dimensions:** The lid outer dimensions ($L \times W \times H_{\text{lid}}$) MUST match the specified spec dimensions (e.g. $120 \times 80 \times 15$). Start with `cq.Workplane("XY").box(length, width, height, centered=(True, True, False))` ($Z \in [0, \text{height}]$). NEVER substitute `wall_thickness` for `height` when `height` is given!
+- **Rim Lip (Sliding Fit):** The rim lip extends from the bottom face ($<Z$, at $Z=0$) of the lid downward into the open box interior.
+  To slide inside the base opening $(L - 2t) \times (W - 2t)$ with clearance $c$ (e.g. $0.3\text{mm}$):
+  `lip_l = (length - 2 * wall_thickness) - 2 * sliding_clearance`
+  `lip_w = (width - 2 * wall_thickness) - 2 * sliding_clearance`
+- **Robust Monolithic Construction Sequence:**
+  NEVER shell a lid from $<Z$ and then try to union a floating lip ring into the empty open air (causes PHYS-01 disconnected solids)!
+  Instead, extrude the lip downward from the solid bottom face, then hollow out the center from $<Z$:
+  ```python
+  # 1. Solid lid block (Z from 0 to height)
+  lid = cq.Workplane("XY").box(length, width, height, centered=(True, True, False))
+
+  # 2. Extrude rim lip downward from bottom face (Z=0)
+  lid = (
+      lid.faces("<Z")
+      .workplane(centerOption="CenterOfMass")
+      .rect(lip_l, lip_w)
+      .extrude(-rim_lip_overlap)
+  )
+
+  # 3. Hollow out the center cavity from <Z (leaving solid ceiling of wall_thickness)
+  lid = (
+      lid.faces("<Z")
+      .workplane(centerOption="CenterOfMass")
+      .rect(lip_l - 2 * wall_thickness, lip_w - 2 * wall_thickness)
+      .cutBlind(rim_lip_overlap + (height - wall_thickness))
+  )
+
+  # 4. Hinge knuckles at back edge (X = -length/2) at bottom seam (Z = 0)
+  cx = -length / 2.0 - knuckle_od / 2.0
+  cz = 0.0
+  k1 = cq.Workplane("XZ").workplane(offset=-10.0).transformed(offset=(cx, cz)).circle(knuckle_od / 2.0).extrude(knuckle_width)
+  k2 = cq.Workplane("XZ").workplane(offset=10.0).transformed(offset=(cx, cz)).circle(knuckle_od / 2.0).extrude(knuckle_width)
+  tab1 = cq.Workplane("XY").workplane(offset=cz - knuckle_od / 2.0).transformed(offset=(cx + knuckle_od / 4.0, -5.0, 0)).box(knuckle_od / 2.0, knuckle_width, knuckle_od, centered=(True, True, False))
+  tab2 = cq.Workplane("XY").workplane(offset=cz - knuckle_od / 2.0).transformed(offset=(cx + knuckle_od / 4.0, 15.0, 0)).box(knuckle_od / 2.0, knuckle_width, knuckle_od, centered=(True, True, False))
+  lid = lid.union(k1).union(k2).union(tab1).union(tab2)
+
+  # 5. Continuous pin bore
+  bore = cq.Workplane("XZ").workplane(offset=-50.0).transformed(offset=(cx, cz)).circle(bore_diameter / 2.0).extrude(100.0)
+  result = lid.cut(bore)
+  # INTERFACE: hinge_knuckle_bore=(cx, 0.0, 0.0) dir=(0, 1, 0) type=hole d=3.2
+  ```
+
+
 
 

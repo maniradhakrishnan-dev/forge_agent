@@ -1,6 +1,42 @@
+# Python cache & compiled bytecode
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
 .venv/
+env/
+venv/
+ENV/
+
+# Environment Variables & Secrets (prevent leaking API keys)
 .env
-artifacts/
+.env.*
+!.env.example
+
+# Test & Coverage
 .pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Linter & Tooling Cache
+.ruff_cache/
+.mypy_cache/
+
+# Build & Packaging
+build/
+dist/
+*.egg-info/
+
+# Project Generated Artifacts & Runs
+artifacts/
+scratch/
+*.log
+
+# OS Clutter
+.DS_Store
+Thumbs.db

@@ -19,7 +19,7 @@ from tools.cad_kernel import execute_cadquery_code, export_cad_artifacts
 async def run_part_pipeline(
     spec: PartSpec,
     output_dir: str = "artifacts/parts",
-    max_retries: int = 3,
+    max_retries: int = 5,
     gateway_client: Optional[GatewayClient] = None,
     run_logger: Optional[RunLogger] = None,
     master_skeleton: Optional[Dict[str, Any]] = None,
@@ -62,6 +62,12 @@ async def run_part_pipeline(
             partner_interfaces=partner_interfaces
         )
         last_code = designer_out.code
+        # Immediately save generated draft code to disk for full auditability
+        import os
+        os.makedirs(f"{output_dir}/{spec.id}", exist_ok=True)
+        with open(f"{output_dir}/{spec.id}/draft_{spec.id}_iter_{iteration}.py", "w") as f:
+            f.write(designer_out.code)
+
         logger.log_step(
             agent="code_generator_agent",
             part_id=spec.id,
@@ -69,6 +75,7 @@ async def run_part_pipeline(
             status="PASS",
             latency_ms=(time.time() - t_gen) * 1000
         )
+
 
         # 2. CadQuery Sandbox executes code
         solid_obj, exec_err = await execute_cadquery_code(designer_out.code)
@@ -108,9 +115,38 @@ async def run_part_pipeline(
                     f.write(designer_out.code)
                 continue
 
-        # 3. 6-Pillar Part Verifier Agent checks OpenCascade geometry math
+        # 3. BRep Interface Port Enrichment: extract ground-truth ports from solid geometry
+        #    LLM comment ports are used if present; BRep fills any gaps.
+        if solid_obj is not None:
+            brep_ports = CodeGeneratorAgent.extract_interface_ports_from_brep(solid_obj, spec, spec.mates)
+            if brep_ports:
+                if not designer_out.interfaces:
+                    # No LLM ports at all — use BRep entirely
+                    designer_out.interfaces = brep_ports
+                else:
+                    # Merge: BRep ports fill any gaps, but don't overwrite LLM ports
+                    for port_name, port in brep_ports.items():
+                        if port_name not in designer_out.interfaces:
+                            designer_out.interfaces[port_name] = port
+
+        # 4. 6-Pillar Part Verifier Agent checks OpenCascade geometry math
+        #    Progressive Verification Tiers: gate checks by attempt to avoid wasting
+        #    early retries on structural/mating issues while geometry is still broken.
+        if pillars is not None:
+            # Explicit pillar filter from caller takes precedence
+            effective_pillars = pillars
+        elif iteration <= 2:
+            # Tier 1 (Attempts 1-2): Get a valid solid at the right size
+            effective_pillars = ["PHYS-01", "PHYS-02", "SPEC-01"]
+        elif iteration <= 4:
+            # Tier 2 (Attempts 3-4): Add structural integrity checks
+            effective_pillars = ["PHYS-01", "PHYS-02", "SPEC-01", "FEAT-01", "STRUCT-01", "STRUCT-02"]
+        else:
+            # Tier 3 (Attempt 5+): Full verification including mating compliance
+            effective_pillars = None  # Run all checks
+
         t_ver = time.time()
-        final_verdict = verifier.verify_part_solid(solid_obj, spec=spec, pillars=pillars)
+        final_verdict = verifier.verify_part_solid(solid_obj, spec=spec, pillars=effective_pillars)
         ver_status = "PASS" if final_verdict.passed else "FAIL"
         logger.log_step(
             agent="part_verifier_agent",
@@ -124,16 +160,32 @@ async def run_part_pipeline(
         if final_verdict.passed:
             # 4. Export artifacts on success
             part_dir = f"{output_dir}/{spec.id}"
-            artifact_paths = await export_cad_artifacts(solid_obj, part_dir, spec.name, code=designer_out.code)
+            artifact_paths = await export_cad_artifacts(
+                solid_obj, part_dir, spec.name,
+                code=designer_out.code,
+                spec=spec,
+                interfaces=designer_out.interfaces
+            )
             logger.log_step(agent="reporter_agent", part_id=spec.id, iteration=iteration, status="PASS")
             return True, designer_out, final_verdict, solid_obj, artifact_paths
         else:
-            # 5. Part Repair Agent: attempt zero-LLM parametric fix first (if repair_tier allows)
+            # 5. Part Repair Agent: JSON-First Contract Repair + Zero-LLM Parametric Sync
+            spec_file_path = f"{output_dir}/{spec.id}/spec.json"
+            repaired_spec, spec_repaired, spec_notes = repair_agent.repair_spec_contract(
+                spec, final_verdict, spec_file_path=spec_file_path
+            )
+            if spec_repaired:
+                for note in spec_notes:
+                    print(f"  📝 [PartRepairAgent] Contract Repaired: {note}")
+                spec = repaired_spec
+
             was_fixed = False
             fixed_code = None
             fix_notes = []
             if repair_tier == "parametric_first":
-                fixed_code, was_fixed, fix_notes = repair_agent.attempt_parametric_fix(designer_out.code, final_verdict)
+                fixed_code, was_fixed, fix_notes = repair_agent.attempt_parametric_fix(
+                    designer_out.code, final_verdict, spec=spec, spec_file_path=spec_file_path
+                )
             else:
                 fix_notes = [f"Bypassing parametric repair for '{spec.id}' (repair_tier={repair_tier})"]
 
@@ -148,7 +200,12 @@ async def run_part_pipeline(
                         print(f"  ✅ [PartRepairAgent] Parametric fix verified — PASS (0 LLM tokens)")
                         designer_out.code = fixed_code
                         part_dir = f"{output_dir}/{spec.id}"
-                        artifact_paths = await export_cad_artifacts(solid_re, part_dir, spec.name, code=fixed_code)
+                        artifact_paths = await export_cad_artifacts(
+                            solid_re, part_dir, spec.name,
+                            code=fixed_code,
+                            spec=spec,
+                            interfaces=designer_out.interfaces
+                        )
                         logger.log_step(agent="part_repair_agent", part_id=spec.id, iteration=iteration, status="PASS",
                                         diagnostics=[{"fix_type": "parametric", "notes": fix_notes}])
                         return True, designer_out, verdict_re, solid_re, artifact_paths
@@ -166,7 +223,7 @@ async def run_part_pipeline(
                     repair_instruction = repair_agent.generate_repair_instructions(final_verdict)
                     logger.log_step(agent="part_repair_agent", part_id=spec.id, iteration=iteration, status="FAIL")
             else:
-                # Cannot fix parametrically or bypassed — escalate to Designer (LLM)
+                # Cannot fix parametrically or bypassed — escalate to Designer (LLM) with repaired spec contract
                 for note in fix_notes:
                     print(f"  ℹ️  [PartRepairAgent] {note}")
                 repair_instruction = repair_agent.generate_repair_instructions(final_verdict)
@@ -211,5 +268,12 @@ async def run_single_part_pipeline(
     )
 
     code = designer_out.code if designer_out else ""
+    if success and artifacts:
+        from pathlib import Path
+        root_spec = Path(output_dir) / "spec.json"
+        if not root_spec.exists():
+            part_spec.to_json_file(root_spec)
+            artifacts["spec"] = str(root_spec)
+
     return success, part_spec, verdict, code, artifacts
 

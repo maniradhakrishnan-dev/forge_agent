@@ -24,86 +24,183 @@ def _find_compatible_ports(
     mate: Optional[Any] = None
 ) -> Tuple[Optional[InterfacePort], Optional[InterfacePort]]:
     """
-    Finds the optimal matching interface ports between two mating parts using multi-criteria scoring:
-    1. Feature Diameter Compatibility (closest matching diameters or matching mate target)
-    2. Feature Type Compatibility (hole <-> shaft, compliant_fit <-> compliant_fit, face <-> face)
-    3. Mate Context and Feature Name Semantic Relevance
+    Finds matching interface ports between two mating parts deterministically using typed contracts:
+    1. Direct contract lookup via mate.mate_port_id or InterfacePort.mate_key
+    2. Exact feature name lookup via mate.my_feature_name
+    3. Matching mate_key contracts between ports
+    4. Complementary feature type and matching diameter lookup
     """
     if not partner_ports or not my_ports:
         return None, None
 
-    # 1. Exact name match shortcut if mate specifies an exact port name in both
-    if mate and mate.my_feature_name in partner_ports and mate.my_feature_name in my_ports:
-        return partner_ports[mate.my_feature_name], my_ports[mate.my_feature_name]
-
-    best_pair: Tuple[Optional[InterfacePort], Optional[InterfacePort]] = (None, None)
-    best_score = -999.0
-
+    mate_port_id = getattr(mate, "mate_port_id", None) if mate else None
+    mate_feature = getattr(mate, "my_feature_name", None) if mate else None
     mate_d = getattr(mate, "my_feature_diameter", None) if mate else None
 
+    # 1. Direct contract lookup via mate.mate_port_id
+    if mate_port_id:
+        target_p = partner_ports.get(mate_port_id)
+        if not target_p:
+            target_p = next((p for p in partner_ports.values() if getattr(p, "mate_key", None) == mate_port_id), None)
+        if target_p:
+            my_p = None
+            if mate_feature and mate_feature in my_ports:
+                my_p = my_ports[mate_feature]
+            if not my_p:
+                my_p = next((p for p in my_ports.values() if getattr(p, "mate_key", None) == mate_port_id or p.name == mate_feature), None)
+            if not my_p:
+                is_target_hole = target_p.feature_type in ("hole", "bore")
+                for p in my_ports.values():
+                    if is_target_hole and p.feature_type in ("shaft", "pin", "bolt", "fastener"):
+                        my_p = p
+                        break
+                    elif not is_target_hole and p.feature_type in ("hole", "bore"):
+                        my_p = p
+                        break
+            if my_p:
+                return target_p, my_p
+
+    # 2. Exact name match shortcut if mate specifies an exact port name in both
+    if mate_feature and mate_feature in partner_ports and mate_feature in my_ports:
+        return partner_ports[mate_feature], my_ports[mate_feature]
+
+    # 3. Check for matching mate_key between my_ports and partner_ports
+    for m_port in my_ports.values():
+        m_key = getattr(m_port, "mate_key", None)
+        if m_key:
+            target_p = partner_ports.get(m_key)
+            if not target_p:
+                target_p = next((p for p in partner_ports.values() if getattr(p, "mate_key", None) == m_key), None)
+            if target_p:
+                return target_p, m_port
+
+    # 4. Typed complementary feature matching (e.g. hole <-> shaft, face <-> face)
+    candidates = []
     for p_name, p_port in partner_ports.items():
+        p_type = (p_port.feature_type or "face").lower()
+        is_p_hole = p_type in ("hole", "bore") or "hole" in p_name.lower() or "bore" in p_name.lower()
+        is_p_shaft = p_type in ("shaft", "pin", "bolt", "fastener") or "shaft" in p_name.lower() or "pin" in p_name.lower()
+
         for m_name, m_port in my_ports.items():
-            score = 0.0
+            m_type = (m_port.feature_type or "face").lower()
+            is_m_hole = m_type in ("hole", "bore") or "hole" in m_name.lower() or "bore" in m_name.lower()
+            is_m_shaft = m_type in ("shaft", "pin", "bolt", "fastener") or "shaft" in m_name.lower() or "pin" in m_name.lower()
 
-            # Exact name match
-            if p_name.lower() == m_name.lower():
-                score += 80.0
+            is_complementary = (is_p_hole and is_m_shaft) or (is_p_shaft and is_m_hole)
+            is_same_type = (p_type == m_type)
 
-            # Check Radial Pitch Circle Radius Compatibility (e.g. carrier pin PCD/2)
-            import math
-            p_r = math.sqrt(p_port.position[0]**2 + p_port.position[1]**2)
-            m_r = math.sqrt(m_port.position[0]**2 + m_port.position[1]**2)
-            if abs(p_r - m_r) <= 1.5 and p_r > 5.0:
-                score += 80.0  # High bonus for matching pitch circle radius (e.g. PCD = 60mm)
+            if not (is_complementary or is_same_type):
+                continue
 
-            # Check Diameter Compatibility
+            d_diff = 0.0
             if p_port.diameter is not None and m_port.diameter is not None:
                 d_diff = abs(p_port.diameter - m_port.diameter)
-                if d_diff <= 1.0:
-                    score += 100.0 - (d_diff * 20.0)  # Up to +100 for matching diameters
-                elif d_diff <= 6.0:
-                    score += 50.0  # Normal for cycloidal orbital pin/hole clearances (2*e)
-                elif d_diff > 12.0:
-                    score -= 100.0  # Heavy penalty for severe diameter mismatch
+                if d_diff > 5.0 and not is_complementary:
+                    continue
 
-            # Match against declared mate diameter
+            # Score deterministic match based on contracts
+            score = 0.0
+            if is_complementary:
+                score += 10.0
             if mate_d is not None:
-                if p_port.diameter is not None and abs(p_port.diameter - mate_d) <= 1.0:
-                    score += 40.0
-                if m_port.diameter is not None and abs(m_port.diameter - mate_d) <= 1.0:
-                    score += 40.0
+                if p_port.diameter is not None and abs(p_port.diameter - mate_d) <= 0.5:
+                    score += 5.0
+                if m_port.diameter is not None and abs(m_port.diameter - mate_d) <= 0.5:
+                    score += 5.0
+            if p_port.diameter is not None and m_port.diameter is not None:
+                score -= d_diff
 
-            # Feature Type Compatibility
-            p_type = p_port.feature_type.lower()
-            m_type = m_port.feature_type.lower()
+            candidates.append((score, p_port, m_port))
 
-            # Same feature type (e.g. compliant_fit <-> compliant_fit, face <-> face)
-            if p_type == m_type:
-                score += 50.0
-
-            # Hole <-> Shaft pairing
-            is_p_hole = p_type in ("hole", "bore") or "hole" in p_name.lower() or "bore" in p_name.lower()
-            is_m_shaft = m_type in ("shaft", "pin", "bolt") or "shaft" in m_name.lower() or "pin" in m_name.lower()
-            is_p_shaft = p_type in ("shaft", "pin", "bolt") or "shaft" in p_name.lower() or "pin" in p_name.lower()
-            is_m_hole = m_type in ("hole", "bore") or "hole" in m_name.lower() or "bore" in m_name.lower()
-
-            if (is_p_hole and is_m_shaft) or (is_p_shaft and is_m_hole):
-                score += 60.0
-
-            # Compliant pairing
-            if getattr(p_port, "is_compliant", False) or getattr(m_port, "is_compliant", False) or "compliant" in p_type or "compliant" in m_type:
-                if "compliant" in p_type and "compliant" in m_type:
-                    score += 70.0
-
-            if score > best_score:
-                best_score = score
-                best_pair = (p_port, m_port)
-
-    if best_pair[0] is not None and best_pair[1] is not None and best_score > 0.0:
-        return best_pair
+    if candidates:
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        return candidates[0][1], candidates[0][2]
 
     # Fallback to first available port pair if no positive match
-    return next(iter(partner_ports.values()), None), next(iter(my_ports.values()), None)
+
+def _align_port_vectors(
+    part_solid: Any,
+    my_port: InterfacePort,
+    target_port: InterfacePort,
+    partner_solid: Optional[Any] = None,
+    is_face_mate: bool = False
+) -> Tuple[Any, Optional[Dict[str, Any]], Tuple[float, float, float]]:
+    """
+    Deterministically computes 3D normal/axis alignment rotation between my_port and target_port.
+    Rotates part_solid around my_port.position so its normal or cylindrical axis aligns with target_port.
+    Returns: (rotated_solid, rotation_info, translation_delta)
+    """
+    v_from = getattr(my_port, "direction", None) or (0.0, 0.0, 1.0)
+    v_to = getattr(target_port, "direction", None) or (0.0, 0.0, 1.0)
+    p_from = getattr(my_port, "position", (0.0, 0.0, 0.0))
+    p_to = getattr(target_port, "position", (0.0, 0.0, 0.0))
+
+    import numpy as np
+    import math
+
+    u = np.array(v_from, dtype=float)
+    v = np.array(v_to, dtype=float)
+    u_norm = np.linalg.norm(u)
+    v_norm = np.linalg.norm(v)
+
+    delta = (p_to[0] - p_from[0], p_to[1] - p_from[1], p_to[2] - p_from[2])
+    if u_norm < 1e-6 or v_norm < 1e-6:
+        return part_solid, None, delta
+
+    u = u / u_norm
+    v = v / v_norm
+
+    # For face mates, outward normals oppose each other (u -> -v).
+    # For shafts/holes/cylinders/pins: check both forward (u -> v) and reverse (u -> -v).
+    candidates = [-v] if is_face_mate else [v, -v]
+
+    best_solid = part_solid
+    best_rot = None
+    best_trans = delta
+    min_overlap = float("inf")
+
+    for target_v in candidates:
+        dot = float(np.dot(u, target_v))
+        if abs(dot - 1.0) < 1e-4:
+            rot_s = part_solid
+            r_info = None
+        elif abs(dot + 1.0) < 1e-4:
+            perp = np.array([1, 0, 0]) if abs(u[0]) < 0.9 else np.array([0, 1, 0])
+            axis = np.cross(u, perp)
+            axis = axis / np.linalg.norm(axis)
+            axis_pt = (round(float(p_from[0] + axis[0]), 4), round(float(p_from[1] + axis[1]), 4), round(float(p_from[2] + axis[2]), 4))
+            p_from_tuple = (round(float(p_from[0]), 4), round(float(p_from[1]), 4), round(float(p_from[2]), 4))
+            rot_s = part_solid.rotate(p_from_tuple, axis_pt, 180.0)
+            r_info = {"center": p_from_tuple, "axis": axis_pt, "angle": 180.0}
+        else:
+            axis = np.cross(u, target_v)
+            axis = axis / np.linalg.norm(axis)
+            angle_deg = math.degrees(math.acos(np.clip(dot, -1.0, 1.0)))
+            axis_pt = (round(float(p_from[0] + axis[0]), 4), round(float(p_from[1] + axis[1]), 4), round(float(p_from[2] + axis[2]), 4))
+            p_from_tuple = (round(float(p_from[0]), 4), round(float(p_from[1]), 4), round(float(p_from[2]), 4))
+            rot_s = part_solid.rotate(p_from_tuple, axis_pt, angle_deg)
+            r_info = {"center": p_from_tuple, "axis": axis_pt, "angle": round(angle_deg, 2)}
+
+        cand_solid = rot_s.translate(delta)
+        if partner_solid is not None:
+            try:
+                ps_obj = _get_shape_obj(partner_solid)
+                cs_obj = _get_shape_obj(cand_solid)
+                overlap = ps_obj.intersect(cs_obj).Volume()
+            except Exception:
+                overlap = 0.0
+        else:
+            overlap = 0.0
+
+        if overlap < min_overlap:
+            min_overlap = overlap
+            best_solid = rot_s
+            best_rot = r_info
+            best_trans = delta
+            if overlap == 0.0:
+                break
+
+    return best_solid, best_rot, best_trans
 
 
 class AssemblyAgent:
@@ -116,7 +213,7 @@ class AssemblyAgent:
         self,
         graph: AssemblyGraph,
         solids: Dict[str, Any],
-        interfaces: Dict[str, Dict[str, InterfacePort]],
+        interfaces: Optional[Dict[str, Dict[str, InterfacePort]]] = None,
         positioning_repair_prompt: str = ""
     ) -> Tuple[Dict[str, Any], Any]:
         """
@@ -124,6 +221,8 @@ class AssemblyAgent:
         (Dict of transformed shapes, top-level cq.Assembly object).
         """
         AgentToolbox.enforce("assembly_agent", "cad_kernel_assembly")
+        if interfaces is None:
+            interfaces = {}
 
         self.last_transforms = {}
         transformed_solids: Dict[str, Any] = {}
@@ -163,12 +262,16 @@ class AssemblyAgent:
 
         # 1. Base Part: Grounded component, housing/casing/frame, or the part with the most mates
         base_part_spec = next(
-            (p for p in graph.parts if any(kw in p.id.lower() or kw in p.name.lower() for kw in ["housing", "casing", "base", "frame", "stator"])),
+            (p for p in graph.parts if (
+                p.part_type in ("base", "frame", "housing", "casing", "chassis", "stator")
+                or getattr(p, "geometry_form", "") in ("housing", "casing", "box_enclosure", "base_plate")
+                or any(kw in p.id.lower() or kw in p.name.lower() for kw in ["housing", "casing", "base", "frame", "stator"])
+            )),
             None
         )
         if not base_part_spec:
             for j in graph.joints:
-                if j.type == "rigid":
+                if j.type in ("rigid", "ground"):
                     p_match = next((p for p in graph.parts if p.id in (j.part_a, j.part_b)), None)
                     if p_match:
                         base_part_spec = p_match
@@ -240,19 +343,18 @@ class AssemblyAgent:
             target_port, my_port = _find_compatible_ports(p_ports, my_ports, mate)
 
             if target_port and my_port:
-                # Calculate translation vector from my_port to target_port
-                tx = target_port.position[0] - my_port.position[0]
-                ty = target_port.position[1] - my_port.position[1]
-                tz = target_port.position[2] - my_port.position[2]
+                partner_solid_obj = transformed_solids.get(partner_id)
+                is_face = (my_port.feature_type == "face" and target_port.feature_type == "face")
+
+                # 3D Normal Vector Alignment (deterministic rotation to match port orientations)
+                part_solid, rot_3d, (tx, ty, tz) = _align_port_vectors(
+                    part_solid, my_port, target_port, partner_solid=partner_solid_obj, is_face_mate=is_face
+                )
 
                 # Ground-truth physical hole snapping: snap fastener/shaft to exact cylindrical hole in partner solid
-                partner_solid_obj = transformed_solids.get(partner_id)
-                if partner_solid_obj and (
-                    my_port.feature_type in ("shaft", "pin", "bolt") or
-                    any(kw in part_spec.name.lower() or kw in part_spec.id.lower() for kw in ["bolt", "pin", "fastener", "screw"])
-                ) and (
-                    target_port.feature_type in ("hole", "bore") or "hole" in target_port.name.lower()
-                ):
+                is_pin_or_shaft = my_port.feature_type in ("shaft", "pin", "bolt", "fastener")
+                is_hole = target_port.feature_type in ("hole", "bore")
+                if partner_solid_obj and is_pin_or_shaft and is_hole:
                     try:
                         cyl_faces = [f for f in partner_solid_obj.Faces() if f.geomType() == "CYLINDER"]
                         real_holes = [f for f in cyl_faces if not partner_solid_obj.isInside(f.Center())]
@@ -262,26 +364,46 @@ class AssemblyAgent:
                             ))
                             h_c = best_h.Center()
                             h_bb = best_h.BoundingBox()
-                            tx = h_c.x - my_port.position[0]
-                            ty = h_c.y - my_port.position[1]
-                            tz = h_bb.zmax - my_port.position[2]
+                            t_dir = getattr(target_port, "direction", (0, 0, 1))
+                            if abs(t_dir[2]) > 0.8:
+                                # Vertical hole: align along Z for head seating
+                                tx = h_c.x - my_port.position[0]
+                                ty = h_c.y - my_port.position[1]
+                                tz = h_bb.zmax - my_port.position[2]
+                            else:
+                                # Horizontal or off-axis hole: snap to exact cylinder center
+                                tx = h_c.x - my_port.position[0]
+                                ty = h_c.y - my_port.position[1]
+                                tz = h_c.z - my_port.position[2]
                     except Exception:
                         pass
 
-                # Apply positioning repair delta if requested by AssemblyRepairAgent
+                # 1. Read axial_offsets from shared_parameters or master_skeleton
+                shared_p = graph.shared_parameters if graph.shared_parameters is not None else graph.master_skeleton
+                axial_offsets = shared_p.get("axial_offsets", {}) if isinstance(shared_p, dict) else {}
+                has_axial_offset = False
+                if part_spec.id in axial_offsets:
+                    try:
+                        tz += float(axial_offsets[part_spec.id])
+                        has_axial_offset = True
+                    except (ValueError, TypeError):
+                        pass
+
+                # 2. Apply positioning repair delta if requested by AssemblyRepairAgent
                 if positioning_repair_prompt and part_spec.id in positioning_repair_prompt:
                     # Check for explicit axial or spatial shifts in the repair instruction
                     import re
-                    shift_m = re.search(r"(?:stack|shift|offset|translate)\s*(?:by|along)?\s*([+-]?[0-9.]+)\s*mm", positioning_repair_prompt, re.IGNORECASE)
+                    shift_m = re.search(r"(?:stack|shift|offset|translate)\s*(?:by|along)?\s*(?:[xyzXYZ]\s*=\s*)?([+-]?[0-9.]+)\s*mm", positioning_repair_prompt, re.IGNORECASE)
                     if shift_m:
                         try:
                             delta_z = float(shift_m.group(1))
-                            tz += delta_z
+                            if not has_axial_offset:
+                                tz += delta_z
+                                has_axial_offset = True
                         except Exception:
                             pass
 
                 # Universal kinematic alignment for mechanisms (gears, linkages, shafts, cams)
-                shared_p = graph.shared_parameters if graph.shared_parameters is not None else graph.master_skeleton
                 part_k = part_spec.kinematic_params or {}
 
                 # Check if this part has an off-axis orbit/center distance defined
@@ -305,14 +427,11 @@ class AssemblyAgent:
                     ty = 0.0
                 else:
                     # Coaxial machine component alignment:
-                    # If this part has a central port at (0, 0) and is not an off-center fastener,
-                    # its rotation center must remain on the central machine axis (0, 0).
-                    has_central_port = any(
-                        (p.position[0]**2 + p.position[1]**2) < 0.25
-                        for p in my_ports.values()
-                    )
-                    is_fastener = any(kw in part_spec.id.lower() or kw in part_spec.name.lower() for kw in ["bolt", "pin", "screw", "fastener"])
-                    if has_central_port and not is_fastener:
+                    # Only zero out tx/ty if BOTH my_port and target_port are coaxial near (0, 0),
+                    # preserving explicit offsets for off-axis hole snapping!
+                    my_is_central = (my_port.position[0]**2 + my_port.position[1]**2) < 0.25
+                    target_is_central = (target_port.position[0]**2 + target_port.position[1]**2) < 0.25
+                    if my_is_central and target_is_central:
                         tx = 0.0
                         ty = 0.0
 
@@ -327,13 +446,15 @@ class AssemblyAgent:
                         overlap_vol = 0.0
 
                     is_nested_mechanism = (
-                        any(kw in part_spec.id.lower() or kw in partner_id.lower() for kw in ("disc", "carrier", "shaft", "planet", "sun", "cycloid", "gear", "pinion"))
-                        and (my_port.feature_type in ("hole", "shaft", "pin", "gear_mesh") or target_port.feature_type in ("hole", "shaft", "pin", "gear_mesh"))
+                        (mate and getattr(mate, "mate_type", "") in ("hole_shaft", "shaft_hole", "gear_mesh", "revolute", "cylindrical", "press_fit", "compliant_fit"))
+                        or (my_port.feature_type in ("shaft", "pin", "bolt", "fastener") and target_port.feature_type in ("hole", "bore"))
+                        or (my_port.feature_type in ("hole", "bore") and target_port.feature_type in ("shaft", "pin", "bolt", "fastener"))
+                        or (my_port.feature_type == "gear_mesh" or target_port.feature_type == "gear_mesh")
                     )
 
                     vol_p = part_solid.Volume() if hasattr(part_solid, "Volume") else 1.0
-                    # If severe volume collision (> 30% or > 50 mm³) occurs coaxially on non-nested parts
-                    if not is_nested_mechanism and overlap_vol > 50.0 and (overlap_vol / max(1.0, vol_p)) > 0.30:
+                    # If severe volume collision (> 30% or > 50 mm³) occurs coaxially on non-nested parts without explicit axial_offsets
+                    if not has_axial_offset and not is_nested_mechanism and overlap_vol > 50.0 and (overlap_vol / max(1.0, vol_p)) > 0.30:
                         bb_partner = partner_solid.BoundingBox()
                         bb_me = part_solid.translate((tx, ty, 0)).BoundingBox()
                         # If target port is at or near top face, stack above partner (+Z)
@@ -349,6 +470,38 @@ class AssemblyAgent:
                                 tz = bb_partner.zmin - bb_me.zmax
                             else:
                                 tz = bb_partner.zmax - bb_me.zmin
+
+                # Sibling Coaxial Collision Prevention:
+                # If multiple components share the same shaft/datum (e.g. multiple blocks or bearings on a shaft),
+                # prevent them from occupying the exact same axial location if no axial offset was explicitly set.
+                if not has_axial_offset:
+                    for other_id, other_solid in transformed_solids.items():
+                        if other_id == partner_id or other_id == part_spec.id:
+                            continue
+                        # Only check if other_solid has no direct mating connection to this part
+                        has_direct_mate = any(m.partner_id == other_id for m in part_spec.mates)
+                        if has_direct_mate:
+                            continue
+
+                        cand = part_solid.translate((tx, ty, tz))
+                        try:
+                            other_overlap = cand.intersect(other_solid).Volume()
+                        except Exception:
+                            other_overlap = 0.0
+
+                        if other_overlap > 1.0:
+                            bb_other = other_solid.BoundingBox()
+                            bb_me = cand.BoundingBox()
+                            # Check bounds of partner_solid (e.g. shaft) so we stay on the physical partner
+                            bb_partner = partner_solid.BoundingBox() if partner_solid else None
+                            if bb_partner and (bb_other.zmax + (bb_me.zmax - bb_me.zmin) + 10.0 > bb_partner.zmax):
+                                # If shifting +Z would push beyond the shaft's top, shift -Z (towards shaft body)
+                                shift = (bb_other.zmin - bb_me.zmax) - 10.0
+                            else:
+                                shift = (bb_other.zmax - bb_me.zmin) + 10.0
+                            tz += shift
+
+
 
                 best_angle = 0.0
                 # Universal 1D tooth/cam mesh angle sweep to eliminate tooth tip clash
@@ -380,14 +533,15 @@ class AssemblyAgent:
                 self.last_transforms[part_spec.id] = {
                     "dz": dz_map.get(part_spec.id, 0.0),
                     "translate": (round(tx, 3), round(ty, 3), round(tz, 3)),
-                    "rotate_z": round(best_angle, 2)
+                    "rotate_z": round(best_angle, 2),
+                    "rotate_3d": rot_3d
                 }
 
                 # Apply final translation
                 moved_solid = part_solid.translate((tx, ty, tz))
 
                 # Multi-instance symmetric circular patterns (e.g. planetary gears or multi-disc assemblies)
-                num_instances = int(shared_p.get("num_instances", shared_p.get("num_planets", shared_p.get("num_discs", 1)))) if c_dist > 0.0 else 1
+                num_instances = int(part_k.get("num_instances") or shared_p.get("num_instances") or 1) if c_dist > 0.0 else 1
                 if num_instances > 1:
                     step_deg = 360.0 / num_instances
                     for k in range(num_instances):
@@ -400,10 +554,18 @@ class AssemblyAgent:
                     transformed_solids[part_spec.id] = moved_solid
                     cq_assembly.add(moved_solid, name=part_spec.id, color=cq.Color(0.2, 0.6, 0.9, 1.0))
             else:
-                # Fallback: stack adjacent along Z if overlapping base solid
+                # Fallback: check explicit axial_offsets or stack adjacent along Z if overlapping base solid
                 partner_solid = transformed_solids.get(partner_id) or transformed_solids.get(base_part_spec.id)
                 fallback_tz = 0.0
-                if partner_solid:
+                shared_p = graph.shared_parameters if graph.shared_parameters is not None else graph.master_skeleton
+                axial_offsets = shared_p.get("axial_offsets", {}) if isinstance(shared_p, dict) else {}
+                if part_spec.id in axial_offsets:
+                    try:
+                        fallback_tz = float(axial_offsets[part_spec.id])
+                        part_solid = part_solid.translate((0, 0, fallback_tz))
+                    except (ValueError, TypeError):
+                        pass
+                elif partner_solid:
                     bb_partner = partner_solid.BoundingBox()
                     bb_me = part_solid.BoundingBox()
                     if part_solid.intersect(partner_solid).Volume() > 10.0:
@@ -489,6 +651,9 @@ class AssemblyAgent:
 
             lines.append(f'# Component: {pid}')
             lines.append(f'{pid} = load_part("{rel_path}")')
+            rot_3d = t.get("rotate_3d")
+            if rot_3d:
+                lines.append(f'{pid} = {pid}.rotate({rot_3d["center"]}, {rot_3d["axis"]}, {rot_3d["angle"]})')
             if abs(dz) > 1e-4:
                 lines.append(f'{pid} = {pid}.translate((0, 0, {dz}))')
             if abs(rot_z) > 1e-4:

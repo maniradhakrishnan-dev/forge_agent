@@ -65,17 +65,17 @@ class CodeGeneratorAgent:
         """
         AgentToolbox.enforce("code_generator_agent", "gateway_client")
 
-        # Detect compliance from spec or description
-        text_check = f"{spec.name} {spec.id} {spec.description} {spec.part_type}".lower()
-        is_compliant = getattr(spec, "is_compliant", False) or any(
-            kw in text_check for kw in [
-                "harmonic", "strain_wave", "flexspline", "flex_spline", "flexible",
-                "wave_generator", "snap_fit", "snapfit", "clip", "latch", "flexure",
-                "living_hinge", "press_fit"
-            ]
+        # Dynamically load skills declared in spec and always resolve through SkillRegistry
+        # to ensure base cadquery_modeling and process skills are always included!
+        from orchestrator.skills.registry import default_registry
+        skills_to_load = default_registry.resolve_skills(
+            explicit_skills=list(getattr(spec, "skills", [])),
+            prompt=f"{spec.name} {spec.description}",
+            part_type=spec.part_type,
+            process=spec.manufacturing_process,
+            is_compliant=getattr(spec, "is_compliant", False)
         )
-
-        process_skill = self._load_process_skill(spec.manufacturing_process, is_compliant=is_compliant)
+        skills_content = default_registry.format_skills_for_prompt(skills_to_load)
         
         system_prompt = (
             "You are the Code Generator Agent (Part Designer) for ForgeAgent, a multi-agent mechanical CAD system.\n"
@@ -96,8 +96,14 @@ class CodeGeneratorAgent:
             "6b. Workplane & Thread Safety:\n"
             "   - NO HELIX: CadQuery Workplane has NO `.helix()` method! NEVER call `.helix()` on a Workplane (AttributeError). Fasteners must be modeled as a nominal cylinder diameter with standard lead-in chamfer at `<Z` or cosmetic annular grooves.\n"
             "   - Workplane CenterOption: When creating a workplane on a face of a solid (e.g. `faces('>Z').workplane(...)` or `faces('>X').workplane(...)`), CadQuery by default re-projects the previous plane origin, causing holes to drill along outer edges/corners. ALWAYS specify `centerOption='CenterOfMass'` (e.g. `.faces('>X').workplane(centerOption='CenterOfMass').hole(...)`) so features are centered on that face!\n"
+            "   - Workplane Offset & Transforms: NEVER pass a tuple to `.workplane(offset=...)`! `.workplane(offset=float)` takes ONLY a single float scalar distance along the face normal. For 3D translation/positioning, use `.transformed(offset=(x, y, z))`.\n"
             "   - Through Holes on Cubes/Blocks: Calling `.hole(d)` cuts through the entire solid. Drilling `>Z` penetrates both +Z and -Z. Do NOT duplicate drill `<Z`.\n"
+            "6c. Pockets, Cavities & Blind Cuts:\n"
+            "   - To cut a cavity/pocket, chain directly on the solid: `.faces('>Z').workplane(centerOption='CenterOfMass').rect(L, W).cutBlind(-depth)`.\n"
+            "   - NEVER assign an intermediate sketch to `result` (e.g. `result = result.faces('>Z').workplane().rect(...)`). `result` must ALWAYS remain a 3D solid!\n"
+            "   - NEVER call `.edges().fillet()` on a 2D sketch (causes 'ValueError: Fillets requires that edges be selected'). Do NOT add unsolicited fillets to internal cut corners when mating with square insert blocks!\n"
             "7. Shared Parameters: If SHARED ASSEMBLY PARAMETERS are provided, inherit those exact dimensions (center distances, matching shaft/bore diameters, clearances) so your part interfaces seamlessly with partner parts.\n"
+
             "8. Output Format:\n"
             "   - When generating from scratch (no PREVIOUS CODE DRAFT): Output complete executable Python code enclosed in ```python ... ``` fences.\n"
             "   - When REPAIRING or ITERATING (when PREVIOUS CODE DRAFT is provided):\n"
@@ -112,8 +118,13 @@ class CodeGeneratorAgent:
             "   When iterating on or repairing existing code (when PREVIOUS CODE DRAFT is provided):\n"
             "   - Only add, remove, or modify the EXACT features explicitly requested in the repair feedback or user prompt.\n"
             "   - NEVER assume or invent unsolicited features (such as extra corner mounting holes, fastener patterns, fillets, chamfers, or pockets) that were not in the user request or previous code.\n"
-            "   - If the user asks for a specific hole (e.g. '10mm center hole'), add ONLY that exact hole. Do NOT add surrounding fastener holes unless specifically instructed.\n\n"
-            f"--- PROCESS & MODELING SKILLS ---\n{process_skill}"
+            "   - If the user asks for a specific hole (e.g. '10mm center hole'), add ONLY that exact hole. Do NOT add surrounding fastener holes unless specifically instructed.\n"
+            "10. DIMENSIONAL INTEGRITY & ZERO HALLUCINATION (CRITICAL):\n"
+            "   The `PartSpec` JSON is the authoritative, typed contract for this part.\n"
+            "   - You MUST declare the exact dimensions from `PartSpec` (`length`, `width`, `height`, `hole_diameter`, `wall_thickness`, and any values in `custom_parameters` or `features`) at the top of the script as variables.\n"
+            "   - NEVER invent or alter these core dimensions. The user or architect defines them in JSON so you do not hallucinate.\n"
+            "   - When constructing the primary base body (e.g. with `.box()` or `.cylinder()`), you MUST USE these dimension variables (e.g. `.box(length, width, height)`)! Do NOT substitute `wall_thickness` or `plate_thickness` for the overall part `height` when `height` is specified in PartSpec!\n\n"
+            f"--- PROCESS & MODELING SKILLS ---\n{skills_content}"
         )
         
         user_message = f"Part Spec:\n{spec.model_dump_json(indent=2)}"
@@ -179,6 +190,10 @@ class CodeGeneratorAgent:
 
         interfaces = self._extract_interface_ports(cleaned_code, spec, mates)
 
+        # Detect identical no-op iterations to prevent deadlocks
+        if previous_code and cleaned_code.strip() == previous_code.strip():
+            print(f"  ⚠️ [DesignerAgent] Warning: LLM generated identical code. No changes made.")
+
         return DesignerOutput(
             part_id=spec.id,
             code=self._normalize_cadquery_code(cleaned_code),
@@ -191,12 +206,35 @@ class CodeGeneratorAgent:
         Normalizes CadQuery code to prevent common CadQuery pitfalls:
         1. When chaining .faces(...).workplane() without centerOption, default to 'CenterOfMass'
            so features/holes are centered on the selected face rather than projected onto edge seams.
+        2. In CadQuery, .workplane(offset=...) requires a float scalar (distance along normal).
+           If an LLM passes a tuple like offset=(0, 0, z) or offset=(z,), extract the scalar z.
+           If a 3D tuple offset=(x, y, z) is passed, transform it to .transformed(offset=(x, y, z)).
         """
         if not code:
             return code
         # Default .faces(...).workplane() to centerOption="CenterOfMass"
         pattern = r"(\.faces\s*\([^)]+\)\s*\.workplane)\s*\(\s*\)"
         code = re.sub(pattern, r'\1(centerOption="CenterOfMass")', code)
+
+        # Fix .workplane(offset=(0, 0, z)) or offset=(0, z) -> offset=z
+        code = re.sub(
+            r'(\.workplane\s*\([^)]*?)offset=\(\s*(?:0(?:\.0)?\s*,\s*)+(?:0(?:\.0)?\s*,\s*)*([^,\)]+)\s*\)',
+            r'\1offset=\2',
+            code
+        )
+
+        # Fix remaining 3D tuples passed to .workplane(offset=(x, y, z)) -> .transformed(offset=(x, y, z))
+        def _replace_3d_workplane_offset(m: re.Match) -> str:
+            pre = m.group(1).rstrip(', ')
+            x, y, z = m.group(2).strip(), m.group(3).strip(), m.group(4).strip()
+            post = m.group(5)
+            return f'{pre}{post}.transformed(offset=({x}, {y}, {z}))'
+
+        code = re.sub(
+            r'(\.workplane\s*\([^)]*?)offset=\(\s*([^,]+)\s*,\s*([^,]+)\s*,\s*([^,\)]+)\s*\)(\s*(\)|,))',
+            _replace_3d_workplane_offset,
+            code
+        )
         return code
 
     @staticmethod
@@ -299,8 +337,8 @@ class CodeGeneratorAgent:
         """Parses # INTERFACE: comment lines from code, or generates defaults from MatingContext."""
         interfaces: Dict[str, InterfacePort] = {}
         
-        # 1. Parse comments (robust to leading/trailing hyphens or decorations)
-        pattern = r"#.*?INTERFACE:\s*(\w+)=\(([^)]+)\)\s*dir=\(([^)]+)\)\s*type=([\w_]+)(?:\s*d=([\d.]+))?(?:\s*max_deflection=([\d.]+))?"
+        # 1. Parse comments (robust to leading/trailing hyphens, 'name=', or decorations)
+        pattern = r"#.*?INTERFACE:\s*(?:name=)?(\w+)=\(([^)]+)\)\s*dir=\(([^)]+)\)\s*type=([\w_]+)(?:\s*d=([\d.]+))?(?:\s*max_deflection=([\d.]+))?"
         matches = re.findall(pattern, code)
         context = {
             "length": spec.length,
@@ -308,19 +346,35 @@ class CodeGeneratorAgent:
             "height": spec.height,
             "thickness": getattr(spec, "wall_thickness", 5.0) or 5.0,
         }
-        # Extract numerical assignments from the top of the CadQuery code
-        for var_name, var_val in re.findall(r"^(\w+)\s*=\s*([0-9.]+)", code, re.MULTILINE):
+        # Extract variables by safely executing parameter assignments up to result / Workplane
+        import math
+        param_lines = []
+        for line in code.splitlines():
+            sline = line.strip()
+            if sline.startswith("result") or "Workplane" in sline:
+                break
+            if "=" in sline and not sline.startswith("#"):
+                param_lines.append(sline)
+        if param_lines:
             try:
-                context[var_name] = float(var_val)
-            except ValueError:
-                pass
+                exec("\n".join(param_lines), {"math": math, "__builtins__": {}}, context)
+            except Exception:
+                # Fallback: simple numeric assignments regex
+                for var_name, var_val in re.findall(r"^(\w+)\s*=\s*([0-9.]+)", code, re.MULTILINE):
+                    try:
+                        context[var_name] = float(var_val)
+                    except ValueError:
+                        pass
 
         def _eval_coord(expr: str) -> float:
             clean = expr.strip()
             try:
                 return float(clean)
             except ValueError:
-                return float(eval(clean, {"__builtins__": {}}, context))
+                try:
+                    return float(eval(clean, {"math": math, "__builtins__": {}}, context))
+                except Exception:
+                    return 0.0
 
         for name, pos_str, dir_str, ftype, d_str, max_def_str in matches:
             try:
@@ -351,22 +405,147 @@ class CodeGeneratorAgent:
                 is_compliant=is_comp
             )
 
-        # 2. Default InterfacePorts if none parsed in comments
-        if not interfaces:
-            hole_d = max(spec.hole_diameter, 2.5)
-            interfaces["hole_center_1"] = InterfacePort(
-                name="hole_center_1",
-                position=(spec.length / 4.0, spec.width / 2.0, spec.height),
-                direction=(0.0, 0.0, 1.0),
-                feature_type="hole",
-                diameter=hole_d
-            )
-            interfaces["shaft_tip"] = InterfacePort(
-                name="shaft_tip",
-                position=(0.0, 0.0, 0.0),
-                direction=(0.0, 0.0, 1.0),
-                feature_type="shaft",
-                diameter=4.0
-            )
+        # 2. If no INTERFACE comments parsed, do NOT fabricate from PartSpec dimensions.
+        # Instead, leave empty — the BRep extractor in post-processing will fill them.
+        # This prevents the assembly agent from using incorrect coordinates.
 
         return interfaces
+
+    @staticmethod
+    def extract_interface_ports_from_brep(
+        solid_obj: Any,
+        spec: 'PartSpec',
+        mates: Optional[List['MatingContext']] = None
+    ) -> Dict[str, InterfacePort]:
+        """
+        Extracts real InterfacePorts from BRep solid geometry (ground truth).
+        Finds cylindrical faces, computes their centers, and matches them to mates.
+        This replaces the old fabrication logic that invented coordinates from PartSpec.
+        """
+        import cadquery as cq
+        ports: Dict[str, InterfacePort] = {}
+
+        shape_obj = solid_obj
+        if hasattr(solid_obj, "val"):
+            shape_obj = solid_obj.val()
+        if shape_obj is None:
+            return ports
+
+        # Extract all cylindrical faces with centers and radii
+        try:
+            wp = cq.Workplane(obj=shape_obj) if not isinstance(solid_obj, cq.Workplane) else solid_obj
+            cyl_faces = wp.faces("%CYLINDER").vals()
+        except Exception:
+            cyl_faces = []
+
+        internal_cyls = []
+        external_cyls = []
+
+        for face in cyl_faces:
+            try:
+                from OCP.BRepAdaptor import BRepAdaptor_Surface
+                from OCP.GeomAbs import GeomAbs_Cylinder
+                surf = BRepAdaptor_Surface(face.wrapped)
+                if surf.GetType() != GeomAbs_Cylinder:
+                    continue
+                cyl = surf.Cylinder()
+                radius = float(cyl.Radius())
+                loc = cyl.Location()
+                axis = cyl.Axis()
+                center = (round(loc.X(), 3), round(loc.Y(), 3), round(loc.Z(), 3))
+                direction = (round(axis.Direction().X(), 3), round(axis.Direction().Y(), 3), round(axis.Direction().Z(), 3))
+
+                # Determine internal vs external using normal dot product
+                is_internal = False
+                try:
+                    axis_dir = cq.Vector(axis.Direction().X(), axis.Direction().Y(), axis.Direction().Z())
+                    for e in face.edges():
+                        if hasattr(e, "geomType") and e.geomType() == "CIRCLE":
+                            pt = e.startPoint()
+                            p_vec = cq.Vector(pt.x - loc.X(), pt.y - loc.Y(), pt.z - loc.Z())
+                            radial = p_vec - axis_dir * p_vec.dot(axis_dir)
+                            if radial.Length > 1e-6:
+                                n = face.normalAt(pt)
+                                is_internal = n.dot(radial.normalized()) < 0
+                                break
+                except Exception:
+                    pass
+
+                entry = {
+                    "center": center,
+                    "direction": direction,
+                    "radius": radius,
+                    "diameter": round(radius * 2.0, 3),
+                    "is_internal": is_internal,
+                    "face": face
+                }
+                if is_internal:
+                    internal_cyls.append(entry)
+                else:
+                    external_cyls.append(entry)
+            except Exception:
+                continue
+
+        # Build ports from BRep cylinders
+        hole_idx = 0
+        shaft_idx = 0
+
+        for cyl_info in internal_cyls:
+            hole_idx += 1
+            port_name = f"hole_center_{hole_idx}"
+            # Compute Z range from bounding box of the face
+            try:
+                bb = cyl_info["face"].BoundingBox()
+                z_top = round(bb.zmax, 3)
+            except Exception:
+                z_top = cyl_info["center"][2]
+
+            ports[port_name] = InterfacePort(
+                name=port_name,
+                position=(cyl_info["center"][0], cyl_info["center"][1], z_top),
+                direction=cyl_info["direction"],
+                feature_type="hole",
+                diameter=cyl_info["diameter"],
+                from_brep=True
+            )
+
+        for cyl_info in external_cyls:
+            shaft_idx += 1
+            port_name = f"shaft_center_{shaft_idx}"
+            try:
+                bb = cyl_info["face"].BoundingBox()
+                z_top = round(bb.zmax, 3)
+            except Exception:
+                z_top = cyl_info["center"][2]
+
+            ports[port_name] = InterfacePort(
+                name=port_name,
+                position=(cyl_info["center"][0], cyl_info["center"][1], z_top),
+                direction=cyl_info["direction"],
+                feature_type="shaft",
+                diameter=cyl_info["diameter"],
+                from_brep=True
+            )
+
+        # If no cylinders found, extract top/bottom face centers as generic face ports
+        if not ports:
+            try:
+                bb = shape_obj.BoundingBox()
+                ports["top_face"] = InterfacePort(
+                    name="top_face",
+                    position=(round((bb.xmin + bb.xmax) / 2, 3), round((bb.ymin + bb.ymax) / 2, 3), round(bb.zmax, 3)),
+                    direction=(0.0, 0.0, 1.0),
+                    feature_type="face",
+                    from_brep=True
+                )
+                ports["bottom_face"] = InterfacePort(
+                    name="bottom_face",
+                    position=(round((bb.xmin + bb.xmax) / 2, 3), round((bb.ymin + bb.ymax) / 2, 3), round(bb.zmin, 3)),
+                    direction=(0.0, 0.0, -1.0),
+                    feature_type="face",
+                    from_brep=True
+                )
+            except Exception:
+                pass
+
+        return ports

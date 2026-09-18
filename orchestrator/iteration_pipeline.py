@@ -36,30 +36,59 @@ from tools.cad_kernel import execute_cadquery_code, export_cad_artifacts
 def resolve_iteration_target(target_path: str) -> Tuple[str, str, Dict[str, Any]]:
     """
     Analyzes target_path to determine if it is a single part or an assembly.
+    Supports .json (spec.json, assembly_graph.json), .py scripts, and directories.
     Returns: (target_type: 'part'|'assembly', resolved_path, metadata)
     """
     p = Path(target_path)
     if not p.exists():
         raise FileNotFoundError(f"Target path does not exist: {target_path}")
 
+    # 1. Direct JSON target (part spec or assembly graph)
+    if p.is_file() and p.suffix == ".json":
+        if p.name == "assembly_graph.json":
+            return "assembly", str(p.parent), {"graph_file": str(p)}
+        try:
+            import json
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and ("parts" in data and "joints" in data):
+                return "assembly", str(p.parent), {"graph_file": str(p)}
+        except Exception:
+            pass
+        return "part", str(p), {"spec_file": str(p)}
+
+    # 2. Direct Python script target
     if p.is_file() and p.suffix == ".py":
         return "part", str(p), {"code_file": str(p)}
 
+    # 3. Directory target
     if p.is_dir():
+        # Check for explicit assembly_graph.json
+        if (p / "assembly_graph.json").exists():
+            return "assembly", str(p), {"graph_file": str(p / "assembly_graph.json")}
+
         # Check for assembly markers: multiple part directories or assembly STEP files
-        part_dirs = [d for d in p.iterdir() if d.is_dir() and any(f.suffix == ".py" for f in d.iterdir())]
+        part_dirs = [
+            d for d in p.iterdir()
+            if d.is_dir() and ((d / "spec.json").exists() or any(f.suffix == ".py" for f in d.iterdir()))
+        ]
         assy_steps = list(p.glob("*assembly*.step"))
 
         if len(part_dirs) >= 2 or len(assy_steps) > 0:
             return "assembly", str(p), {"part_dirs": [str(d) for d in part_dirs]}
 
-        # Check for single part in root of directory
-        py_files = [f for f in p.glob("*.py") if not f.name.startswith("test_")]
+        # Check for single part in root of directory (spec.json or py file)
+        if (p / "spec.json").exists():
+            return "part", str(p / "spec.json"), {"spec_file": str(p / "spec.json")}
+
+        py_files = [f for f in p.glob("*.py") if not f.name.startswith("test_") and not f.name.startswith("run_")]
         if py_files:
             return "part", str(py_files[0]), {"code_file": str(py_files[0])}
 
         # Fallback to single part inside a child directory
         if part_dirs:
+            child_spec = Path(part_dirs[0]) / "spec.json"
+            if child_spec.exists():
+                return "part", str(child_spec), {"spec_file": str(child_spec)}
             child_py = list(Path(part_dirs[0]).glob("*.py"))
             if child_py:
                 return "part", str(child_py[0]), {"code_file": str(child_py[0])}
@@ -77,74 +106,150 @@ async def run_part_iteration(
 ) -> Tuple[bool, PartSpec, Optional[VerificationVerdict], str, Dict[str, str]]:
     """
     Iterates on a single mechanical part:
-    Loads previous code -> Prompts Designer with surgical feedback -> Sandbox -> DFM Verifier -> Export.
+    Loads previous code/spec.json -> Prompts Designer with surgical feedback -> Sandbox -> DFM Verifier -> Export.
     """
     run_id = run_id or str(uuid.uuid4())[:8]
     logger = RunLogger(run_id=run_id, output_dir=output_dir)
     gw = gateway_client or GatewayClient()
     planner = PlannerAgent(gw)
 
-    # 1. Read existing code
-    if os.path.isfile(base_code_or_file):
-        existing_code = Path(base_code_or_file).read_text()
+    existing_code = ""
+    existing_spec: Optional[PartSpec] = None
+
+    target_p = Path(base_code_or_file) if os.path.exists(base_code_or_file) else None
+    if target_p and target_p.is_file():
+        if target_p.suffix == ".json":
+            try:
+                existing_spec = PartSpec.from_json_file(target_p)
+                print(f"  📄 [Iteration] Loaded existing PartSpec from JSON: {target_p}")
+            except Exception as e:
+                print(f"  ⚠️  Could not parse PartSpec from JSON: {e}")
+            # Look for companion .py code in same directory
+            py_candidates = [f for f in target_p.parent.glob("*.py") if not f.name.startswith("test_") and not f.name.startswith("run_")]
+            if py_candidates:
+                existing_code = py_candidates[0].read_text(encoding="utf-8")
+        elif target_p.suffix == ".py":
+            existing_code = target_p.read_text(encoding="utf-8")
+            # Look for companion spec.json in same directory
+            spec_candidate = target_p.parent / "spec.json"
+            if spec_candidate.exists():
+                try:
+                    existing_spec = PartSpec.from_json_file(spec_candidate)
+                except Exception:
+                    pass
+    elif target_p and target_p.is_dir():
+        spec_candidate = target_p / "spec.json"
+        if spec_candidate.exists():
+            try:
+                existing_spec = PartSpec.from_json_file(spec_candidate)
+            except Exception:
+                pass
+        py_candidates = [f for f in target_p.glob("*.py") if not f.name.startswith("test_") and not f.name.startswith("run_")]
+        if py_candidates:
+            existing_code = py_candidates[0].read_text(encoding="utf-8")
     else:
         existing_code = base_code_or_file
 
-    # 0. Attempt zero-LLM parametric edit first (Zero tokens)
-    repair_agent = PartRepairAgent()
-    p_code, p_fixed, p_note = repair_agent.attempt_user_parametric_edit(existing_code, prompt)
-    if p_fixed and p_code:
-        print(f"\n[Iteration] ⚡ Attempting zero-LLM parametric modification: {p_note}...")
-        solid_obj, exec_err = await execute_cadquery_code(p_code)
-        if not exec_err and solid_obj:
-            verifier = PartVerifierAgent(min_wall_thickness=1.5, min_hole_diameter=2.0)
-            verdict = verifier.verify_part_solid(solid_obj)
-            if verdict.passed:
-                print(f"  ✅ [Zero-LLM Iteration] Verification passed with 0 LLM tokens!")
-                artifacts = await export_cad_artifacts(solid_obj, output_dir, "iterated_part", code=p_code)
-                spec = PartSpec(id="iterated_part", name="iterated_part")
-                logger.log_step(agent="part_repair_agent", status="PASS", latency_ms=0.0)
-                logger.generate_summary_markdown(f"Iterate: {prompt}", True)
-                return True, spec, verdict, p_code, artifacts
-        print(f"  ⚠️  Parametric edit did not satisfy verifier; escalating to Planner & Designer LLMs.")
+    # 0. Attempt zero-LLM parametric edit first (Zero tokens) if we have existing code and a prompt
+    if existing_code and prompt and prompt.strip().lower() not in ["rebuild", "regenerate", "update", "from spec", "from json"]:
+        repair_agent = PartRepairAgent()
+        p_code, p_fixed, p_note = repair_agent.attempt_user_parametric_edit(existing_code, prompt)
+        if p_fixed and p_code:
+            print(f"\n[Iteration] ⚡ Attempting zero-LLM parametric modification: {p_note}...")
+            solid_obj, exec_err = await execute_cadquery_code(p_code)
+            if not exec_err and solid_obj:
+                spec_to_verify = existing_spec or PartSpec(id="iterated_part", name="iterated_part")
+                verifier = PartVerifierAgent(min_wall_thickness=spec_to_verify.wall_thickness, min_hole_diameter=spec_to_verify.hole_diameter)
+                verdict = verifier.verify_part_solid(solid_obj, spec=spec_to_verify)
+                if verdict.passed:
+                    print(f"  ✅ [Zero-LLM Iteration] Verification passed with 0 LLM tokens!")
+                    artifacts = await export_cad_artifacts(
+                        solid_obj, output_dir, spec_to_verify.name,
+                        code=p_code, spec=spec_to_verify
+                    )
+                    logger.log_step(agent="part_repair_agent", status="PASS", latency_ms=0.0)
+                    logger.generate_summary_markdown(f"Iterate: {prompt}", True)
+                    return True, spec_to_verify, verdict, p_code, artifacts
+            print(f"  ⚠️  Parametric edit did not satisfy verifier; escalating to Planner & Designer LLMs.")
 
     # Measure base solid envelope to preserve proportions if prompt doesn't specify dimension changes
     base_len, base_wid, base_hgt = 40.0, 30.0, 10.0
-    try:
-        base_solid, _ = await execute_cadquery_code(existing_code)
-        if base_solid:
-            bb = base_solid.BoundingBox()
-            base_len, base_wid, base_hgt = max(bb.xlen, 1.0), max(bb.ylen, 1.0), max(bb.zlen, 1.0)
-    except Exception:
-        pass
+    if existing_code:
+        try:
+            base_solid, _ = await execute_cadquery_code(existing_code)
+            if base_solid:
+                bb = base_solid.BoundingBox()
+                base_len, base_wid, base_hgt = max(bb.xlen, 1.0), max(bb.ylen, 1.0), max(bb.zlen, 1.0)
+        except Exception:
+            pass
 
-    print(f"\n[Iteration] 🧠 Planning modifications for part from user request: '{prompt}'...")
-    t0 = time.time()
-    part_spec = await planner.plan_iteration_part(existing_code, prompt)
-    part_spec.is_single_part = True
-
-    # Preserve base part dimensions if planner left default placeholders (40x30) without explicit prompt constraints
-    explicit = getattr(part_spec, "explicit_constraints", {}) or {}
-    if "length" not in explicit and (part_spec.length == 40.0 or part_spec.length <= 0):
-        part_spec.length = round(base_len, 1)
-    if "width" not in explicit and (part_spec.width == 30.0 or part_spec.width <= 0):
-        part_spec.width = round(base_wid, 1)
-    if "height" not in explicit and (part_spec.height == 10.0 or part_spec.height <= 0):
-        part_spec.height = round(base_hgt, 1)
-
-    logger.log_step(
-        agent="planner_agent",
-        part_id=part_spec.id,
-        status="PASS",
-        latency_ms=(time.time() - t0) * 1000
+    # If existing_spec is available and prompt is empty or just generic rebuild, honor existing_spec directly
+    is_direct_spec_replay = existing_spec is not None and (
+        not prompt or prompt.strip().lower() in ["rebuild", "regenerate", "update", "from spec", "from json", ""]
     )
+
+    if is_direct_spec_replay:
+        print(f"\n[Iteration] 📋 Directly honoring edited PartSpec JSON contract ({existing_spec.name}) — 0 planner hallucination!")
+        part_spec = existing_spec
+        # Check if we can sync the edited spec into existing code directly (Zero LLM tokens)
+        if existing_code:
+            repair_agent = PartRepairAgent()
+            p_code, p_synced, p_notes = repair_agent.attempt_spec_sync_edit(existing_code, existing_spec)
+            if p_synced and p_code:
+                print(f"  ⚡ [Zero-LLM Spec Sync] Synchronized code variables: {', '.join(p_notes)}")
+                solid_obj, exec_err = await execute_cadquery_code(p_code)
+                if not exec_err and solid_obj:
+                    verifier = PartVerifierAgent(min_wall_thickness=part_spec.wall_thickness, min_hole_diameter=part_spec.hole_diameter)
+                    verdict = verifier.verify_part_solid(solid_obj, spec=part_spec)
+                    if verdict.passed:
+                        print(f"  ✅ [Zero-LLM Spec Sync] Verification passed with 0 LLM tokens!")
+                        artifacts = await export_cad_artifacts(
+                            solid_obj, output_dir, part_spec.name,
+                            code=p_code, spec=part_spec
+                        )
+                        logger.log_step(agent="part_repair_agent", status="PASS", latency_ms=0.0)
+                        logger.generate_summary_markdown(f"Iterate from JSON Spec: {part_spec.name}", True)
+                        return True, part_spec, verdict, p_code, artifacts
+                existing_code = p_code
+    else:
+        print(f"\n[Iteration] 🧠 Planning modifications for part from user request: '{prompt}'...")
+        t0 = time.time()
+        part_spec = await planner.plan_iteration_part(existing_code or (existing_spec.model_dump_json() if existing_spec else ""), prompt)
+        part_spec.is_single_part = True
+
+        # Preserve existing_spec properties if planner returned defaults
+        if existing_spec:
+            if not part_spec.custom_parameters and existing_spec.custom_parameters:
+                part_spec.custom_parameters = existing_spec.custom_parameters
+            if not part_spec.features and existing_spec.features:
+                part_spec.features = existing_spec.features
+            if part_spec.name == "iterated_part" and existing_spec.name:
+                part_spec.name = existing_spec.name
+                part_spec.id = existing_spec.id
+
+        # Preserve base part dimensions if planner left default placeholders (40x30) without explicit prompt constraints
+        explicit = getattr(part_spec, "explicit_constraints", {}) or {}
+        if "length" not in explicit and (part_spec.length == 40.0 or part_spec.length <= 0):
+            part_spec.length = round(base_len, 1)
+        if "width" not in explicit and (part_spec.width == 30.0 or part_spec.width <= 0):
+            part_spec.width = round(base_wid, 1)
+        if "height" not in explicit and (part_spec.height == 10.0 or part_spec.height <= 0):
+            part_spec.height = round(base_hgt, 1)
+
+        logger.log_step(
+            agent="planner_agent",
+            part_id=part_spec.id,
+            status="PASS",
+            latency_ms=(time.time() - t0) * 1000
+        )
 
     print(f"[Iteration] ⚙️  Applying surgical modifications to '{part_spec.name}' while preserving existing geometry...")
     mod_prompt = (
-        f"USER ITERATION REQUEST: {prompt}\n"
+        f"USER ITERATION REQUEST: {prompt or 'Update geometry to strictly match PartSpec JSON'}\n"
         f"CRITICAL INSTRUCTIONS:\n"
-        f"1. STRICT MINIMALITY: Implement ONLY the exact modification requested above. Do NOT invent or add unsolicited mounting holes, fasteners, fillets, chamfers, or pockets.\n"
-        f"2. SURGICAL PRESERVATION: Preserve all existing working geometry, parameters, and interface features from PREVIOUS CODE DRAFT unless specifically asked to change them."
+        f"1. STRICT CONTRACT CONFORMANCE: All dimensions and features in PartSpec JSON are immutable requirements.\n"
+        f"2. STRICT MINIMALITY: Implement ONLY the exact modification requested above. Do NOT invent or add unsolicited mounting holes, fasteners, fillets, chamfers, or pockets.\n"
+        f"3. SURGICAL PRESERVATION: Preserve all existing working geometry, parameters, and interface features from PREVIOUS CODE DRAFT unless specifically asked to change them."
     )
 
     passed, designer_out, verdict, solid_obj, artifacts = await run_part_pipeline(
@@ -153,7 +258,7 @@ async def run_part_iteration(
         max_retries=max_retries,
         gateway_client=gw,
         run_logger=logger,
-        initial_code=existing_code,
+        initial_code=existing_code if existing_code else None,
         user_modification_prompt=mod_prompt
     )
 
@@ -167,7 +272,7 @@ async def run_assembly_iteration(
     prompt: str,
     target_part_id: Optional[str] = None,
     output_dir: str = "artifacts/assembly_iteration",
-    max_part_retries: int = 3,
+    max_part_retries: int = 5,
     max_assembly_retries: int = 3,
     gateway_client: Optional[GatewayClient] = None,
     run_id: Optional[str] = None
@@ -214,23 +319,49 @@ async def run_assembly_iteration(
                 pid = f.stem
                 part_codes[pid] = f.read_text()
 
+    # Check for existing AssemblyGraph JSON and per-part spec.json
+    disk_graph_file = base_p / "assembly_graph.json" if (base_p / "assembly_graph.json").exists() else None
+    if not disk_graph_file and (base_p.parent / "assembly_graph.json").exists():
+        disk_graph_file = base_p.parent / "assembly_graph.json"
+
+    disk_graph = None
+    if disk_graph_file:
+        try:
+            disk_graph = AssemblyGraph.from_json_file(disk_graph_file)
+            print(f"  📄 [Assembly Iteration] Loaded existing AssemblyGraph from JSON: {disk_graph_file}")
+            for p in disk_graph.parts:
+                p_spec_file = base_p / p.id / "spec.json"
+                if p_spec_file.exists():
+                    try:
+                        part_specs[p.id] = PartSpec.from_json_file(p_spec_file)
+                        print(f"  📄 [Assembly Iteration] Loaded part spec for '{p.id}' from {p_spec_file}")
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"  ⚠️  Could not parse AssemblyGraph from JSON: {e}")
+
     # Reconstruct or plan updated AssemblyGraph with ConstraintValidator verification
     planning_query = f"Original Design: {original_prompt}\nModification: {prompt}" if original_prompt else prompt
     print(f"\n[Assembly Iteration] 🧠 Planning iteration on assembly with {len(part_codes)} parts {[p for p in part_codes.keys()]}...")
     max_planning_retries = 3
     initial_graph = None
     validation_errors = None
-    for plan_iter in range(1, max_planning_retries + 1):
-        initial_graph = await planner.plan_assembly(planning_query, validation_errors=validation_errors)
-        val_res = ConstraintValidator.validate(initial_graph)
-        if val_res.valid:
-            logger.log_step(agent="constraint_validator", iteration=plan_iter, status="PASS")
-            break
-        print(f"  ⚠️  [ConstraintValidator] Iteration graph consistency check failed (Attempt {plan_iter}/{max_planning_retries}):")
-        for err in val_res.errors:
-            print(f"     • {err}")
-        logger.log_step(agent="constraint_validator", iteration=plan_iter, status="FAIL", diagnostics=val_res.errors)
-        validation_errors = val_res.errors
+
+    if disk_graph and (not prompt or prompt.strip().lower() in ["rebuild", "regenerate", "update", "from spec", "from json", ""]):
+        print(f"  📋 Directly using edited AssemblyGraph from disk — 0 planner hallucination!")
+        initial_graph = disk_graph
+    else:
+        for plan_iter in range(1, max_planning_retries + 1):
+            initial_graph = await planner.plan_assembly(planning_query, validation_errors=validation_errors)
+            val_res = ConstraintValidator.validate(initial_graph)
+            if val_res.valid:
+                logger.log_step(agent="constraint_validator", iteration=plan_iter, status="PASS")
+                break
+            print(f"  ⚠️  [ConstraintValidator] Iteration graph consistency check failed (Attempt {plan_iter}/{max_planning_retries}):")
+            for err in val_res.errors:
+                print(f"     • {err}")
+            logger.log_step(agent="constraint_validator", iteration=plan_iter, status="FAIL", diagnostics=val_res.errors)
+            validation_errors = val_res.errors
 
     # Determine affected parts
     if target_part_id:
@@ -448,6 +579,11 @@ async def run_assembly_iteration(
 
     # 4. Export assembly artifacts
     passed = bool(final_verdict and final_verdict.passed)
+    try:
+        initial_graph.to_json_file(f"{output_dir}/assembly_graph.json")
+    except Exception:
+        pass
+
     if top_assembly and passed:
         try:
             assembler = AssemblyAgent()
@@ -457,7 +593,7 @@ async def run_assembly_iteration(
             assy_py = f"{output_dir}/assembly.py"
             top_assembly.save(assy_step, "STEP")
             top_assembly.save(assy_stl, "STL")
-            part_artifacts["assembly"] = {"step": assy_step, "stl": assy_stl, "py": assy_py}
+            part_artifacts["assembly"] = {"step": assy_step, "stl": assy_stl, "py": assy_py, "spec": f"{output_dir}/assembly_graph.json"}
         except Exception as e:
             print(f"  ⚠️  Assembly export warning: {e}")
 

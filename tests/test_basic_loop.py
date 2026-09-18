@@ -50,6 +50,43 @@ def test_basic_p0_loop_end_to_end(tmp_path):
     print(f"Exported STL: {artifact_paths['stl']}")
 
 
+def test_export_cad_artifacts_with_spec_and_interfaces(tmp_path):
+    """Test export_cad_artifacts generates spec.json and interfaces.json."""
+    import cadquery as cq
+    from tools.cad_kernel import export_cad_artifacts
+    from orchestrator.models import PartSpec, InterfacePort
+
+    solid = cq.Workplane("XY").box(40, 40, 10)
+    spec = PartSpec(id="part_1", name="test_block", length=40.0, width=40.0, height=10.0)
+    ports = {
+        "hole_1": InterfacePort(name="hole_1", position=(0.0, 0.0, 5.0), feature_type="hole", diameter=10.0)
+    }
+
+    out_dir = str(tmp_path / "part_export")
+    artifacts = asyncio.run(export_cad_artifacts(
+        solid, out_dir, "test_block",
+        code="result = cq.Workplane('XY').box(40, 40, 10)",
+        spec=spec,
+        interfaces=ports
+    ))
+
+    assert "step" in artifacts and Path(artifacts["step"]).exists()
+    assert "stl" in artifacts and Path(artifacts["stl"]).exists()
+    assert "py" in artifacts and Path(artifacts["py"]).exists()
+    assert "spec" in artifacts and Path(artifacts["spec"]).exists()
+    assert "interfaces" in artifacts and Path(artifacts["interfaces"]).exists()
+
+    # Verify content of spec.json and interfaces.json
+    spec_json = Path(artifacts["spec"]).read_text()
+    assert '"name": "test_block"' in spec_json
+    assert '"length": 40.0' in spec_json
+
+    iface_json = Path(artifacts["interfaces"]).read_text()
+    assert '"hole_1"' in iface_json
+    assert '"diameter": 10.0' in iface_json
+
+
+
 if __name__ == "__main__":
     test_cadquery_execution()
     test_single_part_verification()

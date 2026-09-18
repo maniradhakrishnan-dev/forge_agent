@@ -34,7 +34,9 @@ from tools.cad_kernel import export_cad_artifacts, execute_cadquery_code
 async def run_full_assembly_pipeline(
     prompt: str,
     output_dir: str = "artifacts/assembly_run",
-    max_part_retries: int = 3,
+    process: Optional[str] = None,
+    depth: Optional[str] = None,
+    max_part_retries: int = 5,
     max_assembly_retries: int = 3,
     gateway_client: Optional[GatewayClient] = None,
     run_id: Optional[str] = None,
@@ -68,10 +70,31 @@ async def run_full_assembly_pipeline(
             latency_ms=(time.time() - t0) * 1000
         )
 
+        # Apply CLI process/depth overrides if provided
+        if process:
+            p_lower = prompt.lower()
+            prompt_has_explicit_process = any(
+                kw in p_lower for kw in ["sheet metal", "cnc", "machin", "lathe", "milled", "3d print", "additive"]
+            )
+            for p in graph.parts:
+                if not prompt_has_explicit_process or not getattr(p, "manufacturing_process", None):
+                    p.manufacturing_process = process
+        if depth:
+            for p in graph.parts:
+                p.verification_depth = depth
+
+
         # 2. Constraint Validator checks pre-design consistency
         val_res = ConstraintValidator.validate(graph)
         if val_res.valid:
             logger.log_step(agent="constraint_validator", iteration=plan_iter, status="PASS")
+            # Persist the assembly graph and per-part specifications as typed contracts on disk
+            try:
+                graph.to_json_file(f"{output_dir}/assembly_graph.json")
+                for p_spec in graph.parts:
+                    p_spec.to_json_file(f"{output_dir}/{p_spec.id}/spec.json")
+            except Exception as e:
+                print(f"  ⚠️  Warning persisting assembly specs: {e}")
             break
         else:
             print(f"  ⚠️  [ConstraintValidator] Consistency check failed (Attempt {plan_iter}/{max_planning_retries}):")
@@ -158,7 +181,20 @@ async def run_full_assembly_pipeline(
                 logger.generate_summary_markdown(prompt, False)
                 return False, graph, AssemblyVerdict(passed=False), {}, {}
 
-    # 4. Multi-Part Assembly & Verification Loop
+    # 4. Single-Part vs Multi-Part Branching
+    if len(graph.parts) == 1:
+        # Standalone single-part specification: already verified via 6-pillar DFM
+        pid = graph.parts[0].id
+        p_artifacts = part_artifacts.get(pid, {})
+        from pathlib import Path
+        root_spec = Path(output_dir) / "spec.json"
+        if not root_spec.exists():
+            graph.parts[0].to_json_file(root_spec)
+        logger.log_step(agent="reporter_agent", iteration=1, status="PASS")
+        logger.generate_summary_markdown(prompt, True)
+        return True, graph, AssemblyVerdict(passed=True), verified_solids, part_artifacts
+
+    # Multi-Part Assembly & Verification Loop
     print(f"\n[Phase 3/4] 🧩 Mating parts and verifying 3D spatial alignment...")
     final_verdict = AssemblyVerdict(passed=False)
     transformed_solids: Dict[str, Any] = {}
@@ -195,7 +231,7 @@ async def run_full_assembly_pipeline(
             print(f"\n[Phase 4/4] 💾 Exporting multi-part assembly CAD artifacts...")
             if cq_assembly:
                 assy_code = assembler.generate_assembly_script(graph, output_dir)
-                assy_artifacts = await export_cad_artifacts(cq_assembly, output_dir, graph.name, code=assy_code)
+                assy_artifacts = await export_cad_artifacts(cq_assembly, output_dir, graph.name, code=assy_code, spec=graph)
                 part_artifacts["assembly"] = assy_artifacts
             logger.log_step(agent="reporter_agent", iteration=assy_iter, status="PASS")
             logger.generate_summary_markdown(prompt, True)
@@ -211,12 +247,25 @@ async def run_full_assembly_pipeline(
 
             if instruction.fault_type == "graph_patch":
                 print(f"  🔧 [AssemblyRepair] Direct graph patch applied (zero LLM): {instruction.prompt}")
+                pos_repair_prompt = instruction.prompt
                 if instruction.patched_graph:
                     graph = instruction.patched_graph
+                    try:
+                        graph.to_json_file(f"{output_dir}/assembly_graph.json")
+                        for p in graph.parts:
+                            p.to_json_file(f"{output_dir}/{p.id}/spec.json")
+                    except Exception:
+                        pass
             elif instruction.fault_type == "tolerance_patch":
                 print(f"  🔧 [AssemblyRepair] Direct tolerance patch applied (zero LLM): {instruction.prompt}")
                 if instruction.patched_graph:
                     graph = instruction.patched_graph
+                    try:
+                        graph.to_json_file(f"{output_dir}/assembly_graph.json")
+                        for p in graph.parts:
+                            p.to_json_file(f"{output_dir}/{p.id}/spec.json")
+                    except Exception:
+                        pass
                 if instruction.patched_code:
                     for pid, fixed_code in instruction.patched_code.items():
                         solid, err = await execute_cadquery_code(fixed_code)

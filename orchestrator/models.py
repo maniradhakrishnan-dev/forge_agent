@@ -4,8 +4,9 @@ Every agent input, output, diagnostic, and run log entry is defined here.
 """
 
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Tuple, Literal
-from pydantic import BaseModel, Field, field_validator
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple, Literal, Union
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -20,6 +21,7 @@ class MatingContext(BaseModel):
         "compliant_fit", "press_fit", "snap_fit"
     ]
     my_feature_name: str = "primary_mate"
+    mate_port_id: Optional[str] = None  # Direct key into partner's InterfacePort dict — no scoring heuristic
     my_feature_diameter: Optional[float] = None
     clearance_mm: float = 0.15
     tolerance_mm: float = 0.05
@@ -39,12 +41,31 @@ class PartSpec(BaseModel):
     height: float = 10.0
     hole_diameter: float = 0.0
     wall_thickness: float = 4.0
+    features: List[Dict[str, Any]] = Field(default_factory=list)
+    custom_parameters: Dict[str, Any] = Field(default_factory=dict)
+    critical_dimensions: Dict[str, float] = Field(default_factory=dict)  # Geometry-form-aware mandatory dimensions (e.g., {"outer_diameter": 6.0, "bore_diameter": 6.15})
+    skills: List[str] = Field(default_factory=list)
     mates: List[MatingContext] = Field(default_factory=list)
     kinematic_params: Dict[str, Any] = Field(default_factory=dict)
-    explicit_constraints: Dict[str, float] = Field(default_factory=dict)
+    explicit_constraints: Dict[str, Any] = Field(default_factory=dict)
     is_single_part: bool = False
     is_compliant: bool = False
     max_deflection_mm: Optional[float] = None
+
+    @field_validator("features", mode="before")
+    @classmethod
+    def normalize_features(cls, v: Any) -> List[Dict[str, Any]]:
+        if isinstance(v, list):
+            res = []
+            for item in v:
+                if isinstance(item, str):
+                    res.append({"name": item})
+                elif isinstance(item, dict):
+                    res.append(item)
+                else:
+                    res.append({"name": str(item)})
+            return res
+        return []
 
     @field_validator("verification_depth", mode="before")
     @classmethod
@@ -62,6 +83,45 @@ class PartSpec(BaseModel):
             return v.lower()
         return "3d_printing"
 
+    @model_validator(mode="after")
+    def sync_axisymmetric_dimensions(self) -> "PartSpec":
+        """
+        Synchronizes width, height, and length for axisymmetric or cylindrical parts.
+        Prevents shafts/pins/gears from inheriting arbitrary rectangular bracket defaults (width=30, height=10).
+        """
+        g_form = self.geometry_form or ""
+        p_type = self.part_type or ""
+        crit = self.critical_dimensions or {}
+        od = crit.get("outer_diameter") or crit.get("diameter") or crit.get("shaft_diameter")
+
+        is_shaft_like = g_form in ("stepped_shaft", "shaft", "bolt", "pin") or p_type in ("shaft", "pin", "bolt")
+        if is_shaft_like:
+            if od is not None and od > 0:
+                self.width = float(od)
+                self.height = float(od)
+                if "length" in crit and crit["length"] > 0:
+                    self.length = float(crit["length"])
+        elif g_form in ("cycloid_disc", "spur_gear", "pinion", "annular_flanged_casing") or p_type in ("disc", "gear"):
+            if od is not None and od > 0:
+                self.length = float(od)
+                self.width = float(od)
+            if "thickness" in crit and crit["thickness"] > 0:
+                self.height = float(crit["thickness"])
+        return self
+
+    def to_json_file(self, path: Union[str, Path]) -> Path:
+        """Saves this PartSpec as a structured JSON contract on disk."""
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(self.model_dump_json(indent=2), encoding="utf-8")
+        return p
+
+    @classmethod
+    def from_json_file(cls, path: Union[str, Path]) -> "PartSpec":
+        """Loads a PartSpec from a structured JSON file."""
+        p = Path(path)
+        return cls.model_validate_json(p.read_text(encoding="utf-8"))
+
 
 class JointDef(BaseModel):
     """Kinematic joint definition between two parts in an assembly."""
@@ -78,10 +138,24 @@ class AssemblyGraph(BaseModel):
     name: str = "assembly"
     description: str = ""
     mechanism_type: str = "custom"
+    skills: List[str] = Field(default_factory=list)
     shared_parameters: Dict[str, Any] = Field(default_factory=dict)
     master_skeleton: Dict[str, Any] = Field(default_factory=dict)
     parts: List[PartSpec] = Field(default_factory=list)
     joints: List[JointDef] = Field(default_factory=list)
+
+    def to_json_file(self, path: Union[str, Path]) -> Path:
+        """Saves this AssemblyGraph as a structured JSON contract on disk."""
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(self.model_dump_json(indent=2), encoding="utf-8")
+        return p
+
+    @classmethod
+    def from_json_file(cls, path: Union[str, Path]) -> "AssemblyGraph":
+        """Loads an AssemblyGraph from a structured JSON file."""
+        p = Path(path)
+        return cls.model_validate_json(p.read_text(encoding="utf-8"))
 
 
 
@@ -93,12 +167,14 @@ class AssemblyGraph(BaseModel):
 class InterfacePort(BaseModel):
     """Named mating feature coordinate exported by Designer for deterministic assembly."""
     name: str  # e.g., "hole_center_1"
+    mate_key: Optional[str] = None  # Explicit pairing key — matches MatingContext.mate_port_id on partner
     position: Tuple[float, float, float]  # (x, y, z)
     direction: Tuple[float, float, float] = (0.0, 0.0, 1.0)  # Face normal vector
     feature_type: str = "face"
     diameter: Optional[float] = None
     max_deflection: Optional[float] = None
     is_compliant: bool = False
+    from_brep: bool = False  # True if extracted from BRep geometry (ground truth), False if from LLM comment
 
 
 class DesignerInput(BaseModel):

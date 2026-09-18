@@ -80,10 +80,16 @@ class ConstraintValidator:
                         partner_id=part.id,
                         mate_type=reciprocal_type,
                         my_feature_name=f"mate_to_{part.id}",
+                        mate_port_id=mate.my_feature_name,
                         my_feature_diameter=reciprocal_d,
                         clearance_mm=c_offset
                     )
                     partner.mates.append(reciprocal)
+                else:
+                    if not reciprocal.mate_port_id and mate.my_feature_name and not mate.my_feature_name.startswith("mate_to_"):
+                        reciprocal.mate_port_id = mate.my_feature_name
+                    if not mate.mate_port_id and reciprocal.my_feature_name and not reciprocal.my_feature_name.startswith("mate_to_"):
+                        mate.mate_port_id = reciprocal.my_feature_name
 
                 # Skip clearance validation if this undirected pair has already been evaluated
                 if pair_key in checked_pairs:
@@ -93,6 +99,25 @@ class ConstraintValidator:
                 # Check clearance consistency for cylindrical mates
                 if mate.my_feature_diameter is not None and reciprocal.my_feature_diameter is not None:
                     if mate.mate_type in ("hole_shaft", "shaft_hole"):
+                        # Helper functions to detect semantic part role
+                        def _is_hole_bearing(p, m_name):
+                            text = f"{p.id} {p.name} {getattr(p, 'part_type', '')} {getattr(p, 'geometry_form', '')} {m_name}".lower()
+                            return any(k in text for k in ("bracket", "housing", "block", "plate", "enclosure", "bore", "hole", "socket", "pocket"))
+
+                        def _is_shaft_bearing(p, m_name):
+                            text = f"{p.id} {p.name} {getattr(p, 'part_type', '')} {getattr(p, 'geometry_form', '')} {m_name}".lower()
+                            return any(k in text for k in ("shaft", "pin", "bolt", "rod", "axle", "needle", "stud", "shank"))
+
+                        # Detect and heal inverted mate types (e.g. LLM assigned shaft_hole to block and hole_shaft to shaft)
+                        if mate.mate_type == "shaft_hole" and reciprocal.mate_type == "hole_shaft":
+                            if _is_hole_bearing(part, mate.my_feature_name) and _is_shaft_bearing(partner, reciprocal.my_feature_name):
+                                mate.mate_type = "hole_shaft"
+                                reciprocal.mate_type = "shaft_hole"
+                        elif mate.mate_type == "hole_shaft" and reciprocal.mate_type == "shaft_hole":
+                            if _is_shaft_bearing(part, mate.my_feature_name) and _is_hole_bearing(partner, reciprocal.my_feature_name):
+                                mate.mate_type = "shaft_hole"
+                                reciprocal.mate_type = "hole_shaft"
+
                         # Correctly assign hole and shaft roles
                         if mate.mate_type == "hole_shaft":
                             hole_part, shaft_part = part, partner
@@ -206,11 +231,91 @@ class ConstraintValidator:
         for j in graph.joints:
             connected_parts.add(j.part_a)
             connected_parts.add(j.part_b)
-
         if len(graph.parts) > 1:
             for p in graph.parts:
                 if p.id not in connected_parts:
                     errors.append(f"Orphan part '{p.id}' has no mates or joints connecting it to the assembly graph.")
+
+        # 6. Validate Geometry Form & Critical Dimensions Consistency
+        for part in graph.parts:
+            g_form = getattr(part, "geometry_form", "") or ""
+            crit_dims = getattr(part, "critical_dimensions", {})
+            if crit_dims is None:
+                crit_dims = {}
+                part.critical_dimensions = crit_dims
+
+            # If part is a prismatic bracket, plate, or rectangular block, it must not have outer_diameter
+            is_prismatic = g_form in ("bracket", "flanged_plate", "box_enclosure", "plate") or getattr(part, "part_type", "") in ("bracket", "plate", "block")
+            if is_prismatic and "outer_diameter" in crit_dims:
+                # If bore_diameter is missing, salvage it as bore_diameter if there's a hole mate
+                if "bore_diameter" not in crit_dims and any(m.mate_type == "hole_shaft" or "bore" in m.my_feature_name.lower() or "hole" in m.my_feature_name.lower() for m in part.mates):
+                    crit_dims["bore_diameter"] = crit_dims.pop("outer_diameter")
+                else:
+                    crit_dims.pop("outer_diameter", None)
+
+            # Auto-populate critical_dimensions from mates if missing
+            for m in part.mates:
+                if m.my_feature_diameter is not None and m.my_feature_diameter > 0:
+                    if (m.mate_type in ("shaft_hole", "press_fit") or "shaft" in m.my_feature_name.lower()) and not is_prismatic:
+                        if "outer_diameter" not in crit_dims and "diameter" not in crit_dims and "shaft_diameter" not in crit_dims:
+                            crit_dims["outer_diameter"] = m.my_feature_diameter
+                    elif m.mate_type in ("hole_shaft",) or "hole" in m.my_feature_name.lower() or "bore" in m.my_feature_name.lower():
+                        if "bore_diameter" not in crit_dims and "hole_diameter" not in crit_dims:
+                            crit_dims["bore_diameter"] = m.my_feature_diameter
+
+            # Auto-populate critical_dimensions from custom_parameters
+            cp = part.custom_parameters or {}
+            for k in ("outer_diameter", "diameter", "bore_diameter", "shaft_diameter", "pin_diameter", "thickness", "pitch_diameter", "module"):
+                if k in cp and k not in crit_dims:
+                    try:
+                        crit_dims[k] = float(cp[k])
+                    except (ValueError, TypeError):
+                        pass
+
+            # Validate geometry form consistency
+            if g_form in ("stepped_shaft", "shaft"):
+                od = crit_dims.get("outer_diameter") or crit_dims.get("diameter") or crit_dims.get("shaft_diameter")
+                if od is None:
+                    shaft_mate = next((m for m in part.mates if m.my_feature_diameter is not None), None)
+                    if shaft_mate:
+                        crit_dims["outer_diameter"] = shaft_mate.my_feature_diameter
+                    elif part.width > 0 and part.width < part.length:
+                        crit_dims["outer_diameter"] = part.width
+                    else:
+                        crit_dims["outer_diameter"] = min(part.length, part.width, 20.0)
+
+            # Ensure critical_dimensions match declared mate diameters
+            for m in part.mates:
+                if m.my_feature_diameter is not None:
+                    if m.mate_type == "shaft_hole":
+                        od = crit_dims.get("outer_diameter") or crit_dims.get("shaft_diameter")
+                        if od is not None and abs(od - m.my_feature_diameter) > 0.05:
+                            crit_dims["outer_diameter"] = m.my_feature_diameter
+                    elif m.mate_type == "hole_shaft":
+                        bd = crit_dims.get("bore_diameter") or crit_dims.get("hole_diameter")
+                        if bd is not None and abs(bd - m.my_feature_diameter) > 0.05:
+                            crit_dims["bore_diameter"] = m.my_feature_diameter
+
+            # Synchronize bounding box dimensions for axisymmetric parts:
+            is_axisymmetric = (
+                g_form in ("stepped_shaft", "shaft", "bolt", "pin", "cycloid_disc", "spur_gear", "pinion", "revolved_dish", "annular_flanged_casing")
+                or part.part_type in ("shaft", "pin", "bolt", "disc", "gear")
+            )
+            if is_axisymmetric:
+                od = crit_dims.get("outer_diameter") or crit_dims.get("diameter") or crit_dims.get("shaft_diameter")
+                if od is not None and od > 0:
+                    od_val = float(od)
+                    if g_form in ("stepped_shaft", "shaft", "bolt", "pin") or part.part_type in ("shaft", "pin", "bolt"):
+                        part.width = od_val
+                        part.height = od_val
+                        if "length" in crit_dims and crit_dims["length"] > 0:
+                            part.length = float(crit_dims["length"])
+                    elif g_form in ("cycloid_disc", "spur_gear", "pinion", "annular_flanged_casing") or part.part_type in ("disc", "gear"):
+                        part.length = od_val
+                        part.width = od_val
+                        thick = crit_dims.get("thickness") or cp.get("thickness")
+                        if thick:
+                            part.height = float(thick)
 
         is_valid = len(errors) == 0
         return ValidationResult(valid=is_valid, errors=errors)

@@ -70,7 +70,7 @@ class AssemblyRepairAgent:
                 return self._positioning_fault(failed_diags, involved,
                     f"Mating clearance is {clearance}mm (> 0.5mm limit). "
                     f"Parts '{involved}' are displaced in 3D space. "
-                    f"Please align the mating InterfacePorts so features coincide."
+                    f"Translate by Z=-{clearance}mm to close the gap and align the InterfacePorts."
                 )
 
             # Small clearance deviation → try tolerance patch
@@ -219,11 +219,16 @@ class AssemblyRepairAgent:
             part_a = p_specs.get(involved[0])
             part_b = p_specs.get(involved[1])
             if part_a and part_b:
-                # Stack part_b on top of part_a
-                z_offset = part_a.height
+                # Stack part_b on top of part_a with clearance spacing
                 patched_graph = copy.deepcopy(graph)
                 if "axial_offsets" not in patched_graph.shared_parameters:
                     patched_graph.shared_parameters["axial_offsets"] = {}
+                current_offset = float(patched_graph.shared_parameters["axial_offsets"].get(involved[1], 0.0))
+                step = part_a.height if part_a.height > 0 else 10.0
+                if current_offset < step:
+                    z_offset = step
+                else:
+                    z_offset = current_offset + step
                 patched_graph.shared_parameters["axial_offsets"][involved[1]] = z_offset
 
                 return RepairInstruction(
@@ -276,6 +281,7 @@ class AssemblyRepairAgent:
                                 # Adjust the hole side
                                 if "hole" in mate.mate_type.split("_")[0]:
                                     mate.my_feature_diameter = round(mate.my_feature_diameter + delta, 3)
+                                    part.hole_diameter = mate.my_feature_diameter
 
         # Try to patch code variables if available
         if part_codes:

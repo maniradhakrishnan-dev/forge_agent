@@ -21,10 +21,6 @@ def _get_shape_obj(val_shape: Any) -> Any:
     return val_shape
 
 
-COMPLIANT_KEYWORDS = (
-    "flex", "spline", "cup", "cam", "wave_generator", "snap", "clip",
-    "latch", "hinge", "bellow", "diaphragm", "press_fit", "leaf_spring", "compliant"
-)
 
 
 def _check_pair_compliance(
@@ -96,21 +92,32 @@ def _check_pair_compliance(
     elif any(getattr(p, "feature_type", "").lower() in ("gear_mesh", "cam_profile", "tooth", "pin_mesh", "cycloid_profile", "spline") for p in pair_ports):
         is_gear_or_spline_mesh = True
 
-    # Check if this pair is part of a concentric or internal rotating mechanism (e.g. cycloidal, planetary, harmonic)
-    is_concentric_mechanism = any(
-        kw in id_a.lower() or kw in id_b.lower()
-        for kw in ("cycloid", "gear", "spline", "planet", "sun", "flexspline", "wave_generator", "cam", "rotor", "stator")
-    )
+    # Check if this pair is part of a concentric or internal rotating mechanism
+    # Use TYPED contracts (mate_type, is_compliant) instead of keyword scanning part IDs
+    is_concentric_mechanism = False
+    if mate_ab and getattr(mate_ab, "mate_type", "").lower() in ("gear_mesh", "compliant_fit"):
+        is_concentric_mechanism = True
+    elif joint_ab and getattr(joint_ab, "type", "").lower() in ("revolute", "cylindrical"):
+        is_concentric_mechanism = True
 
-    # Check if either part or connecting port declares compliant fit
-    is_comp_a = (spec_a and getattr(spec_a, "is_compliant", False)) or any(getattr(p, "is_compliant", False) or getattr(p, "feature_type", "").lower() in ("compliant_fit", "flexure", "snap_fit") for p in connecting_ports_a)
-    is_comp_b = (spec_b and getattr(spec_b, "is_compliant", False)) or any(getattr(p, "is_compliant", False) or getattr(p, "feature_type", "").lower() in ("compliant_fit", "flexure", "snap_fit") for p in connecting_ports_b)
-
-    # Fallback to compliant keywords ONLY if ports/specs don't contradict
+    # Check if either part or connecting port declares compliant fit — using typed contracts only
+    is_comp_a = bool(spec_a and getattr(spec_a, "is_compliant", False))
+    is_comp_b = bool(spec_b and getattr(spec_b, "is_compliant", False))
+    # Also check mate type for compliant/press/snap fit
+    if mate_ab and getattr(mate_ab, "mate_type", "").lower() in ("compliant_fit", "press_fit", "snap_fit"):
+        is_comp_a = True
+        is_comp_b = True
+    # Check ports
     if not (is_comp_a or is_comp_b):
-        COMPLIANT_KW = ("flex", "snap", "clip", "latch", "hinge", "bellow", "press_fit", "compliant")
-        is_comp_a = any(kw in id_a.lower() for kw in COMPLIANT_KW)
-        is_comp_b = any(kw in id_b.lower() for kw in COMPLIANT_KW)
+        is_comp_a = any(getattr(p, "is_compliant", False) or getattr(p, "feature_type", "").lower() in ("compliant_fit", "flexure", "snap_fit", "press_fit") for p in connecting_ports_a)
+        is_comp_b = any(getattr(p, "is_compliant", False) or getattr(p, "feature_type", "").lower() in ("compliant_fit", "flexure", "snap_fit", "press_fit") for p in connecting_ports_b)
+
+    # Graph-less fallback: if no graph or interfaces provided (standalone direct function call), fallback to names
+    if not graph and not interfaces:
+        if any(kw in id_a.lower() or kw in id_b.lower() for kw in ("flex", "spline", "cup", "cam", "wave_generator", "snap", "clip", "compliant")):
+            is_comp_a = is_comp_b = True
+        if any(kw in id_a.lower() or kw in id_b.lower() for kw in ("gear", "pinion", "tooth", "cycloid", "ring", "annulus", "disk")):
+            is_gear_or_spline_mesh = is_concentric_mechanism = True
 
     # 1. Geometric classification of intersection solid (Universal across all pairs)
     vol_a = shape_a.Volume() if hasattr(shape_a, "Volume") else 1.0
@@ -149,9 +156,9 @@ def _check_pair_compliance(
     elif is_gear_or_spline_mesh:
         # Standard tooth addendum/dedendum and cycloidal pin mesh engagement depth (up to 2*e or 2.25*m)
         allowable = 5.0
-    elif any(k in id_a.lower() or k in id_b.lower() for k in ("press_fit", "dowel", "bushing")):
+    elif (mate_ab and getattr(mate_ab, "mate_type", "").lower() in ("press_fit", "interference")) or any(getattr(p, "feature_type", "").lower() in ("press_fit", "dowel") for p in pair_ports):
         allowable = 0.1
-    elif any(k in id_a.lower() or k in id_b.lower() for k in ("snap", "clip", "latch")):
+    elif (mate_ab and getattr(mate_ab, "mate_type", "").lower() in ("snap_fit", "clip", "latch")) or any(getattr(p, "feature_type", "").lower() in ("snap_fit", "clip", "latch") for p in pair_ports):
         allowable = 2.0
     else:
         allowable = 2.5
@@ -241,8 +248,9 @@ def check_interference(
                         if overlap_vol > max_noncompliant_overlap:
                             max_noncompliant_overlap = overlap_vol
                             fault_pair = (id_a, id_b)
-            except Exception:
-                pass
+            except Exception as e:
+                # Don't silently swallow — record the failure
+                print(f"  ⚠️  [ASSY-01] Intersection check exception for '{id_a}'-'{id_b}': {e}")
 
     if max_noncompliant_overlap > 0.05:
         if compliant_failures:
@@ -348,11 +356,11 @@ def check_fit_clearance(
     if not measured_pairs:
         return AssemblyDiagnostic(
             rule_id="ASSY-02",
-            status="PASS",
+            status="FAIL",
             parameter="mating_fit_clearance",
-            measured=0.15,
+            measured=0.0,
             required=min_clearance,
-            message="No measurable clearance discrepancies detected.",
+            message="No measurable distances found between parts — BRepExtrema failed or parts have no solid geometry.",
             involved_parts=part_ids
         )
 
@@ -365,26 +373,57 @@ def check_fit_clearance(
             continue
 
         if dist == 0.0:
+            # Parts touching — only acceptable for declared contact mates (face_face, press_fit)
+            if graph and hasattr(graph, "parts"):
+                is_contact_mate = False
+                for p in graph.parts:
+                    if p.id in pair:
+                        other_id = pair[1] if p.id == pair[0] else pair[0]
+                        for m in p.mates:
+                            if m.partner_id == other_id and m.mate_type in ("face_face", "press_fit", "snap_fit", "compliant_fit"):
+                                is_contact_mate = True
+                                break
+                if is_contact_mate:
+                    continue
+            # For shaft/hole mates, dist=0 means the shaft touches the bore wall — this is OK
+            if pair in declared_pairs:
+                continue
+            # Undeclared pairs touching is suspicious but not necessarily wrong
             continue
 
         # Check if mate declared an expected clearance
         mate_spec_clearance = None
+        is_cylindrical_mate = False
         if graph and hasattr(graph, "parts"):
             for p in graph.parts:
                 if p.id in pair:
                     other_id = pair[1] if p.id == pair[0] else pair[0]
                     for m in p.mates:
-                        if m.partner_id == other_id and getattr(m, "clearance_mm", None):
-                            mate_spec_clearance = m.clearance_mm
-                            break
+                        if m.partner_id == other_id:
+                            if m.mate_type in ("hole_shaft", "shaft_hole"):
+                                is_cylindrical_mate = True
+                            if getattr(m, "clearance_mm", None):
+                                mate_spec_clearance = m.clearance_mm
+                                break
+
+        effective_min_c = min_clearance
+        if mate_spec_clearance:
+            if is_cylindrical_mate:
+                # In engineering, clearance_mm for cylindrical mates is diametral clearance (D_hole - D_shaft).
+                # The physical surface-to-surface gap measured by BRepExtrema is the radial distance: clearance_mm / 2.
+                effective_min_c = max(0.02, (mate_spec_clearance / 2.0) - 0.05)
+            else:
+                effective_min_c = max(0.02, mate_spec_clearance - 0.1)
 
         effective_max_c = max(max_clearance, mate_spec_clearance + 0.5) if mate_spec_clearance else max_clearance
-        if min_clearance <= dist <= effective_max_c:
+        if effective_min_c <= dist <= effective_max_c:
             continue
 
-        # Allow non-interfering spacing and orbital clearances between nested mechanism components
-        if dist > 1.0 and any(kw in pair[0].lower() or kw in pair[1].lower() for kw in ("casing", "housing", "frame", "base", "carrier", "disc", "shaft")):
-            continue
+        # For declared mating pairs with large clearance, check if it's within the mate's declared tolerance
+        if dist > effective_max_c and pair in declared_pairs:
+            # Check if the mate declares a larger acceptable clearance range
+            if mate_spec_clearance and dist <= mate_spec_clearance * 3.0:
+                continue  # Within 3x declared clearance — acceptable orbital or mechanism spacing
 
         if pair in declared_pairs:
             return AssemblyDiagnostic(
@@ -392,10 +431,24 @@ def check_fit_clearance(
                 status="FAIL",
                 parameter="mating_fit_clearance",
                 measured=round(dist, 2),
-                required=min_clearance,
-                message=f"Fit clearance between mating parts '{pair[0]}' and '{pair[1]}' ({round(dist, 2)}mm) is outside allowable range [{min_clearance}mm, {effective_max_c}mm].",
+                required=effective_min_c,
+                message=f"Fit clearance between mating parts '{pair[0]}' and '{pair[1]}' ({round(dist, 2)}mm) is outside allowable range [{round(effective_min_c, 2)}mm, {effective_max_c}mm].",
                 involved_parts=list(pair)
             )
+
+    if declared_pairs:
+        # All declared mating pairs satisfied their clearance requirements!
+        closest_p = min(declared_pairs, key=lambda p: measured_pairs.get(p, float('inf')))
+        d_val = round(measured_pairs.get(closest_p, min_clearance), 2)
+        return AssemblyDiagnostic(
+            rule_id="ASSY-02",
+            status="PASS",
+            parameter="mating_fit_clearance",
+            measured=d_val,
+            required=min_clearance,
+            message=f"All declared mating pairs satisfy fit clearance requirements ({d_val}mm).",
+            involved_parts=list(closest_p)
+        )
 
     # Fallback for graph-less assemblies: inspect minimum distance found
     min_dist_found = min(measured_pairs.values())

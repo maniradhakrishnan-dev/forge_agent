@@ -158,4 +158,66 @@ def test_constraint_validator_orphan_part_error():
     assert any("Orphan part" in err for err in res.errors)
 
 
+def test_constraint_validator_inverted_hole_shaft_role_healing():
+    """LLM inverts hole_shaft & shaft_hole between block and shaft. Validator auto-swaps and cleans dimensions."""
+    p1 = PartSpec(
+        id="part_1",
+        name="support_block",
+        part_type="bracket",
+        geometry_form="bracket",
+        length=50.0,
+        width=50.0,
+        height=10.0,
+        hole_diameter=20.0,
+        critical_dimensions={"outer_diameter": 20.0},
+        mates=[
+            MatingContext(
+                partner_id="part_2",
+                mate_type="shaft_hole",  # Inverted by LLM
+                my_feature_name="central_bore",
+                mate_port_id="shaft_surface",
+                my_feature_diameter=20.0,
+                clearance_mm=0.15
+            )
+        ]
+    )
+    p2 = PartSpec(
+        id="part_2",
+        name="long_shaft",
+        part_type="shaft",
+        geometry_form="stepped_shaft",
+        length=1000.0,
+        critical_dimensions={"outer_diameter": 20.0, "length": 1000.0},
+        mates=[
+            MatingContext(
+                partner_id="part_1",
+                mate_type="hole_shaft",  # Inverted by LLM
+                my_feature_name="shaft_surface",
+                mate_port_id="central_bore",
+                my_feature_diameter=20.15,
+                clearance_mm=0.15
+            )
+        ]
+    )
+    joint = JointDef(id="joint_1", type="cylindrical", part_a="part_1", part_b="part_2")
+    graph = AssemblyGraph(parts=[p1, p2], joints=[joint])
+
+    res = ConstraintValidator.validate(graph)
+    assert res.valid is True
+    assert len(res.errors) == 0
+
+    # Roles must be swapped to physical truth:
+    # p1 (block) has the hole -> hole_shaft, feature diameter 20.15
+    assert p1.mates[0].mate_type == "hole_shaft"
+    assert p1.mates[0].my_feature_diameter == 20.15
+    # p2 (shaft) is the shaft -> shaft_hole, feature diameter 20.0
+    assert p2.mates[0].mate_type == "shaft_hole"
+    assert p2.mates[0].my_feature_diameter == 20.0
+
+    # Bogus outer_diameter on bracket must be purged or converted to bore_diameter
+    assert "outer_diameter" not in p1.critical_dimensions
+    assert p1.critical_dimensions.get("bore_diameter") == 20.15
+
+
+
 

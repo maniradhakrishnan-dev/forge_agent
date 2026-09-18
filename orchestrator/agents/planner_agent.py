@@ -28,49 +28,29 @@ PLANNER_SYSTEM_PROMPT = """You are the Lead Mechanical Architect & Planner Agent
 
 Your job: Decompose the user's plain-English mechanical design prompt into a high-taste, structurally sound, and kinematically rigorous AssemblyGraph JSON.
 
-## Architectural Taste & Form Idioms (CRITICAL):
-1. **Form Follows Function (Axisymmetric vs Prismatic Idioms)**:
-   - **Rotating Transmissions & Gearboxes (Cycloidal, Planetary, Harmonic, Bearings)**:
-     * Housings/Casings MUST be modeled as **cylindrical/annular bodies with circular bolt flanges (`geometry_form: "annular_flanged_casing"` or `"cylindrical_housing"`)**, NEVER raw rectangular boxes or slabs that waste material.
-     * Shafts MUST be **stepped shafts (`geometry_form: "stepped_shaft"`)** with bearing journals, shoulders, and eccentric lobes.
-     * Planet/Output Carriers MUST be **flanges with extruded drive pins/studs (`geometry_form: "pin_carrier_flange"`)**.
-     * Discs/Gears MUST be **true analytical discs (`geometry_form: "cycloid_disc"` or `"spur_gear"`)**.
-   - **Structural Brackets & Frames**:
-     * Use ribbed L-brackets, webbed plates, or gusseted flanges (`geometry_form: "bracket"` or `"flanged_plate"`).
+## Architectural Principles & Rules:
+1. **Form Follows Function**:
+   - Axisymmetric components (housings, shafts, discs, gears, pulleys) must be modeled with cylindrical/annular envelopes (`geometry_form: "annular_flanged_casing"`, `"stepped_shaft"`, `"cycloid_disc"`), avoiding material-wasting rectangular slabs.
+   - Structural brackets, ribs, and plates should use webbed forms (`geometry_form: "bracket"`, `"flanged_plate"`).
 
-2. **Kinematic Invariants & Top-Down Invariant Math**:
-   - You MUST compute and populate all kinematic relations into `shared_parameters` so downstream parts NEVER guess:
-   - **Cycloidal Drives (e.g. Ratio = R:1)**:
-     * `reduction_ratio`: R
-     * `num_lobes` (disc): R (e.g. 10 lobes for 10:1)
-     * `num_ring_pins` (housing): R + 1 (e.g. 11 pins for 10 lobes)
-     * `eccentricity`: 1.5 to 3.0 mm (e.g. 2.0 mm)
-     * `pin_ring_pcd`: Pitch diameter of stationary ring pins (e.g. 120.0 mm)
-     * `pin_diameter`: Stationary ring pin roller diameter (e.g. 8.0 mm)
-     * `carrier_pin_pcd`: Pitch circle diameter for output drive pins (e.g. 60.0 mm - MUST BE IDENTICAL in disc and carrier)
-     * `output_pin_diameter`: Diameter of carrier drive pins (e.g. 6.0 mm)
-     * `disc_carrier_hole_diameter`: output_pin_diameter + (2 * eccentricity) + 0.5 mm (oversized hole allowing orbital motion)
-   - **Planetary Gearboxes**:
-     * Invariant: `num_teeth_ring = num_teeth_sun + 2 * num_teeth_planet`
-     * `module`: 1.5 - 3.0 mm
-     * `center_distance`: module * (num_teeth_sun + num_teeth_planet) / 2
-     * `num_planets`: 3 (or 4)
-   - **Harmonic / Strain Wave Drives**:
-     * Invariant: `num_teeth_circular_spline - num_teeth_flexspline = 2`
-     * Flexspline marked `"is_compliant": true`
+2. **Kinematic Invariants & Top-Down Consistency**:
+   - Compute and populate all kinematic relations (pitch circle diameters, tooth ratios, center distances, reduction ratios) in `shared_parameters`.
+   - Ensure matching mating features between partner parts share the exact same pitch circle diameters and center-to-center distances.
 
-3. **Single-Part vs Multi-Part Mechanisms (CRITICAL)**:
-   - If the user prompt requests a **standalone part, fastener, plate, bracket, dish, or single component** (e.g. "a bolt", "a nut", "an L-bracket", "a dining plate", "a pulley", "a spur gear"):
-     * Do NOT arbitrarily split it into multiple sub-parts!
-     * Set `"is_single_part": true`, with `parts` containing exactly 1 item and `joints: []`.
-     * A bolt has its head and threaded shank modeled as **ONE monolithic part** (`geometry_form: "bolt"`).
-     * A plate or bowl is **ONE monolithic part** (`geometry_form: "revolved_dish"`).
-     * An L-bracket is **ONE monolithic part** (`geometry_form: "bracket"`).
-   - Multi-part decomposition is ONLY for assemblies and mechanisms with distinct moving or separable parts (e.g. gearboxes, drives, linkages, bolted joint assemblies).
+3. **Single-Part vs Multi-Part Decomposition**:
+   - Standalone parts (a single bolt, screw, nut, bracket, plate, bowl, pulley, or gear) MUST be 1 part in `parts` (`is_single_part: true`) and 0 joints in `joints`.
+   - Multi-part decomposition is required whenever the prompt describes multiple interacting, mating, or inserted components (e.g. shafts inserted into holes of a block, gears meshing, bolts fastening plates together, linkages, or speed reducers).
+   - Decompose every individual physical part into the `parts` list with its corresponding `id`, `name`, `geometry_form`, `part_type`, `critical_dimensions`, and `mates`.
 
-4. **Explicit Constraints vs Inferred Defaults (CRITICAL)**:
-   - In `explicit_constraints`, extract ONLY numbers and dimensions that the user explicitly stated in their prompt (e.g. if prompt says '15mm dia and 50mm length and head 25mm', set `explicit_constraints: {"diameter": 15.0, "length": 50.0, "head_size": 25.0}`).
-   - If the user prompt did NOT specify exact dimensions (e.g. 'Design a simple L bracket with mounting holes'), leave `explicit_constraints: {}` EMPTY! The `length`, `width`, `height` you provide will then serve as suggested proportions rather than rigid failure criteria.
+4. **Explicit Constraints vs Inferred Defaults**:
+   - In `explicit_constraints`, extract ONLY dimensions and numbers the user explicitly stated in their prompt.
+   - If user did not specify exact dimensions, leave `explicit_constraints: {}` empty.
+
+5. **Dynamic Skill Assignment**:
+   - Review the AVAILABLE ENGINEERING SKILLS catalog appended below.
+   - For `AssemblyGraph.skills`, assign the high-level mechanism and assembly skills (e.g. `["assembly_strategies", "fits_and_tolerances"]`).
+   - For each `PartSpec.skills`, assign the specific component and manufacturing skills needed for that exact part (e.g. `["stepped_shaft", "dfm_3d_printing", "fits_and_tolerances"]` or `["fasteners_and_flanges", "dfm_3d_printing"]`).
+   - Assign ONLY valid skill names from the Available Engineering Skills catalog.
 
 ## Output Schema (respond ONLY with raw JSON, no markdown fences):
 
@@ -78,16 +58,10 @@ Your job: Decompose the user's plain-English mechanical design prompt into a hig
   "name": "short_snake_case_assembly_name",
   "description": "the user's original spec",
   "mechanism_type": "single_part | cycloidal_drive | planetary_gearbox | harmonic_drive | linkage | bracket_assembly | fastener",
+  "skills": ["mechanism_skill_name", "dfm_skill_name"],
   "shared_parameters": {
-    "reduction_ratio": 10.0,
-    "num_lobes": 10,
-    "num_ring_pins": 11,
-    "eccentricity": 2.0,
-    "pin_ring_pcd": 120.0,
-    "pin_diameter": 8.0,
-    "carrier_pin_pcd": 60.0,
-    "output_pin_diameter": 6.0,
-    "disc_carrier_hole_diameter": 10.5
+    "center_distance": 40.0,
+    "clearance": 0.15
   },
   "parts": [
     {
@@ -98,20 +72,28 @@ Your job: Decompose the user's plain-English mechanical design prompt into a hig
       "geometry_form": "annular_flanged_casing | stepped_shaft | cycloid_disc | pin_carrier_flange | spur_gear | bracket | bolt | nut | revolved_dish",
       "manufacturing_process": "3d_printing | cnc_machining | sheet_metal",
       "verification_depth": "concept | functional | manufacturing | assembly_ready",
-      "length": 140.0,
-      "width": 140.0,
-      "height": 30.0,
+      "skills": ["stepped_shaft", "dfm_3d_printing"],
+      "length": 40.0,
+      "width": 30.0,
+      "height": 10.0,
       "hole_diameter": 6.0,
-      "wall_thickness": 5.0,
+      "wall_thickness": 4.0,
+      "custom_parameters": {},
+      "critical_dimensions": {
+        "outer_diameter": 6.0,
+        "length": 40.0
+      },
+      "features": [],
       "explicit_constraints": {},
       "is_single_part": true,
       "is_compliant": false,
       "mates": [
         {
           "partner_id": "part_2",
-          "mate_type": "hole_shaft | shaft_hole | face_face | edge_edge | gear_mesh",
-          "my_feature_name": "feature_name",
-          "my_feature_diameter": 6.0,
+          "mate_type": "hole_shaft (if THIS part has the hole/bore) | shaft_hole (if THIS part is the shaft/pin) | face_face | edge_edge | gear_mesh",
+          "my_feature_name": "central_bore (if hole) | shaft_tip (if shaft)",
+          "mate_port_id": "shaft_tip (partner's mating feature)",
+          "my_feature_diameter": 6.15,
           "clearance_mm": 0.15
         }
       ]
@@ -129,12 +111,17 @@ Your job: Decompose the user's plain-English mechanical design prompt into a hig
 }
 
 ## Engineering & DFM Rules:
-1. Single vs Multi-Part: Standalone parts (bolts, screws, nuts, brackets, plates, bowls) MUST be 1 part in `parts` and 0 joints in `joints`.
-2. Mechanism Completeness: For multi-part assemblies, include all essential functional parts to complete the kinematic loop (e.g. cycloidal drive requires input eccentric shaft, cycloid disc, ring pin housing, and output pin carrier).
-3. Shared Parameters (Top-Down Consistency): All shared diameters, pin counts, lobe counts, and pitch circle diameters MUST be declared in `shared_parameters` and matched across mating parts.
-4. Axisymmetric Envelopes: For annular casings/flanges, `length` and `width` represent the outer flange diameter (e.g. 140.0 for a D=140mm circular flange).
-5. Running / Clearance Fits: Mating holes must be strictly larger than mating shafts (hole = shaft + clearance).
-6. Respond with ONLY the raw JSON object. No explanation, no markdown fences."""
+1. Single vs Multi-Part: Standalone parts MUST be 1 part in `parts` and 0 joints in `joints`.
+2. Mechanism Completeness: For multi-part assemblies, include all essential functional parts to complete the kinematic loop.
+3. Running / Clearance Fits: Mating holes must be strictly larger than mating shafts (hole = shaft + clearance).
+4. Geometry-Form Aware Critical Dimensions: For every part, declare explicit `critical_dimensions` (e.g., for a shaft: `{"outer_diameter": 6.0, "length": 40.0}`, for a housing: `{"bore_diameter": 6.15, "outer_diameter": 30.0, "height": 20.0}`). Downstream verifiers check OpenCascade BRep geometry directly against `critical_dimensions`.
+   - Never assign `outer_diameter` in `critical_dimensions` to rectangular blocks or brackets. Only use `outer_diameter` for axisymmetric/cylindrical parts (shafts, pins, bushings, discs, gears).
+5. Explicit Port Mating Contract: In each `mates` entry, define `my_feature_name` and `mate_port_id` (the name of the partner's mating port) so the Assembler can mate them deterministically without scoring heuristics.
+6. Typed Contract Invariants: All critical dimensions MUST be typed in `length`, `width`, `height`, `hole_diameter`, `wall_thickness`, `custom_parameters`, and `critical_dimensions` so the downstream Designer never hallucinates.
+7. Mating Direction Conventions (Hole vs Shaft):
+   - `"hole_shaft"`: Used by the part containing the HOLE/BORE. `my_feature_diameter` MUST be the bore diameter (e.g., 20.15).
+   - `"shaft_hole"`: Used by the part containing the SHAFT/PIN/BOLT. `my_feature_diameter` MUST be the shaft diameter (e.g., 20.0).
+8. Respond with ONLY the raw JSON object. No explanation, no markdown fences."""
 
 
 class PlannerAgent:
@@ -148,12 +135,30 @@ class PlannerAgent:
     ) -> AssemblyGraph:
         """
         Uses LLM to decompose user prompt into a structured AssemblyGraph.
+        Dynamically injects relevant domain skills from the SkillRegistry.
         If validation_errors from ConstraintValidator are provided, feeds them back
         for self-correction.
-        Raises PlannerParseError if the LLM response cannot be parsed.
-        Raises LLMAPIError if the API call fails.
         """
         AgentToolbox.enforce("planner_agent", "gateway_client")
+
+        # Dynamically inject the full registry skill catalog into the Planner prompt
+        from orchestrator.skills.registry import default_registry
+        catalog_text = default_registry.format_catalog_for_planner()
+
+        system_prompt = PLANNER_SYSTEM_PROMPT
+        if catalog_text:
+            system_prompt += f"\n\n## AVAILABLE ENGINEERING SKILLS IN REGISTRY (Assign to graph.skills and part.skills):\n{catalog_text}"
+
+        # If mechanism-specific skills (e.g. cycloidal, planetary) or complex kinematics are applicable,
+        # also attach detailed formulas from the skill contents
+        mechanism_skills = [
+            s for s in ["cycloidal_drive", "planetary_gearbox", "compliant_mechanisms"]
+            if any(term in prompt.lower() for term in s.split("_"))
+        ]
+        if mechanism_skills:
+            detailed_skills_text = default_registry.format_skills_for_prompt(mechanism_skills)
+            if detailed_skills_text:
+                system_prompt += f"\n\n## DETAILED MECHANISM KINEMATIC FORMULAS:\n{detailed_skills_text}"
 
         user_content = f"Design Prompt: {prompt}"
         if validation_errors:
@@ -165,7 +170,7 @@ class PlannerAgent:
             )
 
         messages = [
-            {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content}
         ]
 

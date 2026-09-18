@@ -248,6 +248,19 @@ class TestSyntaxFix:
         assert was_fixed is False
         assert fixed_code is None
 
+    def test_syntax_fix_produces_executable_solid(self, agent):
+        """Verifies that removing fillet/chamfer leaves an executable script returning a Solid."""
+        error = "Standard_Failure: There are no suitable edges for chamfer or fillet"
+        code = "import cadquery as cq\nresult = cq.Workplane('XY').circle(7.5).extrude(50).edges('>Z').fillet(1.0)"
+        fixed_code, was_fixed, notes = agent.attempt_syntax_fix(code, error)
+        assert was_fixed is True
+        assert ".edges('>Z')" not in fixed_code
+        scope = {}
+        exec(fixed_code, scope, scope)
+        assert "result" in scope
+        assert type(scope["result"].val()).__name__ == "Solid"
+        assert len(scope["result"].faces().vals()) == 3
+
 
 # ---------------------------------------------------------------------------
 # 4. Variable Replacement Tests

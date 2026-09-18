@@ -140,18 +140,6 @@ class LiveGraphExecutor:
         await self.store.apply_patch(GraphPatch(action="ADD_NODE", node=planner_node))
         await self.store.apply_patch(GraphPatch(action="EMIT_EVENT", event_message=f"[{run_id}] Started prompt execution: '{prompt}'"))
 
-        p_lower = prompt.lower()
-        is_single = any(w in p_lower for w in ["single part", "single component", "standalone", "just the", "only the"])
-        is_assembly = not is_single and (
-            depth == "assembly_ready" or any(kw in p_lower for kw in [
-                "assemb", "aseemb", "drive", "harmonic", "strain wave", "cycloid",
-                "gear", "transmission", "reducer", "reduction", "speed reducer",
-                "gearbox", "gear box", "planetary", "differential", "stage",
-                "mechanism", "actuator", "gripper", "linkage", "coupl",
-                "bolt", "nut", "washer", "joint", "connect", "mate", "fasten", "screw", "rivet"
-            ])
-        )
-
         # Callback mapping real-time pipeline events into graph store
         async def _on_step(entry):
             agent = entry.agent
@@ -214,31 +202,27 @@ class LiveGraphExecutor:
 
         run_logger = RunLogger(run_id=run_id, output_dir=output_dir, on_step_callback=_on_step)
 
-        if is_assembly:
-            passed, graph, verdict, solids, artifacts = await run_full_assembly_pipeline(
-                prompt=prompt,
-                output_dir=output_dir,
-                gateway_client=gw,
-                run_id=run_id,
-                run_logger=run_logger
-            )
-            if passed:
-                planner_node.status = "PASS"
-                await self.store.apply_patch(GraphPatch(action="UPDATE_NODE", node=planner_node))
+        # Always execute via the universal pipeline driven by the PlannerAgent's decomposition.
+        # Zero keyword guessing — the LLM Planner decomposes into 1 or N parts.
+        passed, graph, verdict, solids, artifacts = await run_full_assembly_pipeline(
+            prompt=prompt,
+            output_dir=output_dir,
+            process=process,
+            depth=depth,
+            gateway_client=gw,
+            run_id=run_id,
+            run_logger=run_logger
+        )
+
+        if passed:
+            planner_node.status = "PASS"
+            await self.store.apply_patch(GraphPatch(action="UPDATE_NODE", node=planner_node))
+            if graph and len(graph.parts) > 1:
                 await self.store.apply_patch(GraphPatch(
                     action="ADD_NODE",
                     node=GraphNode(id="node_assembly_verifier", label="Assembly Verifier", agent_role="assembly_verifier_agent", status="PASS")
                 ))
-        else:
-            passed, spec, verdict, code, artifacts = await run_single_part_pipeline(
-                prompt=prompt,
-                output_dir=output_dir,
-                gateway_client=gw,
-                run_logger=run_logger
-            )
-            if passed:
-                planner_node.status = "PASS"
-                await self.store.apply_patch(GraphPatch(action="UPDATE_NODE", node=planner_node))
+            else:
                 await self.store.apply_patch(GraphPatch(
                     action="ADD_NODE",
                     node=GraphNode(id="node_part_verifier", label="Part Verifier", agent_role="part_verifier_agent", status="PASS")

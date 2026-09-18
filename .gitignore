@@ -37,6 +37,11 @@ artifacts/
 scratch/
 *.log
 
+# Internal working notes & proposals
+working_md/
+only_me/
+capstone_proposal/
+
 # OS Clutter
 .DS_Store
 Thumbs.db
